@@ -1,0 +1,17 @@
+{
+  "name": "fup-bun",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "check": "bun run src/bin/fup-check.ts",
+    "reset": "bun run src/bin/fup-reset.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.43.1",
+    "mysql2": "^3.12.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0"
+  }
+}
