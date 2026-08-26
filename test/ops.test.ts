@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { asBig, computeDelta, isQuotaReached } from "../src/fup.ts";
-import { quotaReached } from "../src/ops.ts";
+import { quotaReached, redact, validUser } from "../src/ops.ts";
 
 describe("fup pure math (consumed by ops.ts)", () => {
   test("computeDelta: monotonic counter takes the difference", () => {
@@ -35,5 +35,35 @@ describe("quota decision", () => {
   test("ops.re-exported quotaReached matches the pure one", () => {
     expect(quotaReached(5n, 10n)).toBe(false);
     expect(quotaReached(10n, 10n)).toBe(true);
+  });
+
+  test("bigint counters survive large values without precision loss", () => {
+    const a = 9_007_199_254_740_993n; // 2^53 + 1
+    const b = 9_007_199_254_740_993n;
+    expect(a + b).toBe(18_014_398_509_481_986n);
+    expect(asBig(a)).toBe(a);
+  });
+});
+
+describe("hardening: input validation + redaction", () => {
+  test("validUser accepts word chars, @, ., - and rejects control chars", () => {
+    expect(validUser("alice")).toBe(true);
+    expect(validUser("alice@isp.net-1")).toBe(true);
+    expect(validUser("")).toBe(false);
+    expect(validUser("a".repeat(65))).toBe(false);
+    expect(validUser("bad\u0007user")).toBe(false);
+    expect(validUser("bad\u0000user")).toBe(false);
+    expect(validUser("bad\u007fuser")).toBe(false);
+    expect(validUser("has space")).toBe(false);
+    expect(validUser("slash/invalid")).toBe(false);
+  });
+
+  test("redact masks every secret occurrence, including regex metachars", () => {
+    expect(redact("secret is h3110", ["h3110"])).toBe("secret is ***");
+    expect(redact("pass*word", ["pass*word"])).toBe("***");
+    expect(redact("xxpass*wordyy", ["pass*word"])).toBe("xx***yy");
+    expect(redact("a:b", [])).toBe("a:b");
+    expect(redact("x", ["x", "x"])).toBe("***");
+    expect(redact("", ["anything"])).toBe("");
   });
 });

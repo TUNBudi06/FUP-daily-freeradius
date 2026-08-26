@@ -14,6 +14,39 @@ import { ATTR, DEFAULT_FUP_RATE } from "./declare.ts";
 import { asBig, computeDelta, isQuotaReached } from "./fup.ts";
 import { sendCoa } from "./coa.ts";
 
+/** Word-chars plus the few safe separators allowed in a radius username. */
+const reUser = /^[\w@.\-]+$/;
+
+/**
+ * Redact every occurrence of any secret with `***`. Split/join (not regex) so
+ * secret content containing regex metacharacters is still fully replaced.
+ * Call this before any value reaches `logger.log`.
+ */
+export function redact(value: string, secrets: string[]): string {
+  let out = value;
+  for (const s of secrets) {
+    if (!s) continue;
+    out = out.split(s).join("***");
+  }
+  return out;
+}
+
+/**
+ * True when `u` is a safe radius username: 1..64 chars, no control characters,
+ * and only word chars plus `@`, `.`, `-`. Used to skip malformed rows before
+ * any logging or CoA.
+ */
+export function validUser(u: string): boolean {
+  if (!u || u.length > 64 || u.length === 0) return false;
+  const first = u.charCodeAt(0);
+  if (first < 0x20 || first === 0x7f) return false;
+  for (let i = 0; i < u.length; i++) {
+    const c = u.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return false;
+  }
+  return reUser.test(u);
+}
+
 /** One active accounting session pulled from `radacct`. */
 export interface SessionState {
   acctuniqueid: string;
@@ -269,6 +302,7 @@ export async function coaFanOut(
   const ips = await activeSessionIps(db, username);
   if (ips.length === 0) return false;
   let ack = false;
+  const secrets = [cfg.nas.secret, cfg.db.password];
   for (const ip of ips) {
     // Only CoA a validated address — never touch a malformed one.
     if (!isValidIp(ip)) {
@@ -276,7 +310,10 @@ export async function coaFanOut(
       continue;
     }
     const res = await sendCoa(cfg, username, ip, rate, "throttle");
-    logger.log(res.ok ? "COA_ACK" : "COA_FAILED", `${username} IP=${ip} -> ${rate} (${res.detail})`);
+    logger.log(
+      res.ok ? "COA_ACK" : "COA_FAILED",
+      redact(`${username} IP=${ip} -> ${rate} (${res.detail})`, secrets),
+    );
     if (res.ok) ack = true;
   }
   return ack;
@@ -370,6 +407,10 @@ export async function runCheckCycle(
 
   for (const [username, use] of daily) {
     examined++;
+    if (!validUser(username)) {
+      logger.log("SKIP", `invalid username ${username}`);
+      continue;
+    }
     const plan = await resolveUserPlan(db, username);
     if (plan.quota <= 0n) continue;
     logger.log("DAILY_USAGE", `${username} = ${use.dailyInput +use.dailyOutput} bytes (quota=${plan.quota})`);
@@ -414,6 +455,10 @@ export async function recoverResetTimeUsers(
   );
   let recovered = 0;
   for (const { username, throttled_at } of throttled) {
+    if (!validUser(username)) {
+      logger.log("SKIP", `invalid username ${username}`);
+      continue;
+    }
     const plan = await resolveUserPlan(db, username);
     if (plan.resetMinutes == null || throttled_at == null) continue;
     const graceMs = plan.resetMinutes * 60_000;

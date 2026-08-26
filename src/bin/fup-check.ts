@@ -14,6 +14,9 @@ async function main(): Promise<void> {
   const logger: Logger = createLogger(cfg.logFile);
   const lock = new Lock(cfg.lockFile);
 
+  // Concurrency: the lock is held for the whole cycle. A `false` acquire means
+  // another run already holds it — exit cleanly before touching any state so
+  // no partial write can happen (CoA fan-out / daily counters stay consistent).
   if (!(await lock.acquire())) {
     logger.log("SKIP", "another run holds the lock; exiting 0");
     process.exit(0);

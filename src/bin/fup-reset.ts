@@ -29,6 +29,9 @@ async function main(): Promise<void> {
   const logger: Logger = createLogger(cfg.logFile);
   const lock = new Lock(cfg.lockFile);
 
+  // Concurrency: the lock covers the whole reset. A `false` acquire means another
+  // run (e.g. the minute cron) holds it — exit cleanly before rebasing baselines
+  // or clearing quotas, so no partial write is possible.
   if (!(await lock.acquire())) {
     logger.log("SKIP", "another run holds the lock; exiting 0");
     process.exit(0);
