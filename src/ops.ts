@@ -310,6 +310,121 @@ export function quotaReached(daily: bigint, quota: bigint): boolean {
   return isQuotaReached(daily, quota);
 }
 
+/** Throttle/state row for one user from `fup_state`. */
+export interface ThrottleState {
+  throttled: boolean;
+  fupDate: string | null;
+  throttledAt: Date | null;
+}
+
+/**
+ * Read a user's throttle flag, active FUP day, and throttled_at timestamp.
+ * Missing rows default to unthrottled/current-day/no-throttle-time, matching
+ * the Bash `COALESCE` defaults.
+ */
+export async function fetchThrottleState(db: Db, username: string): Promise<ThrottleState> {
+  const row = await first<{ throttled: unknown; fup_date: string | null; throttled_at: Date | null }>(
+    db,
+    db.query.execute(sql`
+      SELECT COALESCE(throttled, 0) AS throttled,
+             COALESCE(fup_date, CURRENT_DATE) AS fup_date,
+             throttled_at
+      FROM fup_state WHERE username = ${username} LIMIT 1
+    `),
+  );
+  return {
+    throttled: asBig(row?.throttled) === 1n,
+    fupDate: row?.fup_date ?? null,
+    throttledAt: row?.throttled_at ?? null,
+  };
+}
+
+/**
+ * Run one full check cycle (mirrors `fup-coa-check.sh`): ensure a `fup_state`
+ * row and day rollover, then for each user past quota and not throttled, CoA
+ * the FUP rate and mark throttled on an ACK. Returns per-user counters for the
+ * SUMMARY log.
+ */
+export async function runCheckCycle(
+  cfg: AppConfig,
+  db: Db,
+  logger: Logger,
+): Promise<{ examined: number; throttled: number }> {
+  const today = new Date().toISOString().slice(0, 10);
+  const daily = await aggregateUsage(db);
+
+  // Ensure a fup_state row exists and roll a stale day over (NEW_DAY reset).
+  await db.query.execute(sql`
+    INSERT INTO fup_state (username, normal_rate, fup_date, throttled, last_updated)
+    SELECT username, NULL, ${today}, 0, NOW() FROM fup_session_state
+    GROUP BY username
+    ON DUPLICATE KEY UPDATE username = username
+  `);
+  await db.query.execute(sql`
+    UPDATE fup_state SET throttled = 0, last_updated = NOW()
+    WHERE fup_date IS NOT NULL AND fup_date <> ${today}
+  `);
+
+  let examined = 0;
+  let throttled = 0;
+
+  for (const [username, use] of daily) {
+    examined++;
+    const plan = await resolveUserPlan(db, username);
+    if (plan.quota <= 0n) continue;
+    logger.log("DAILY_USAGE", `${username} = ${use.dailyInput +use.dailyOutput} bytes (quota=${plan.quota})`);
+    const state = await fetchThrottleState(db, username);
+    if (state.throttled) continue;
+    if (!isQuotaReached(use.dailyInput + use.dailyOutput, plan.quota)) continue;
+
+    logger.log("FUP_REACHED", `${username} (usage=${use.dailyInput + use.dailyOutput} >= quota=${plan.quota})`);
+    // Save normal rate + prime throttled=0 before the CoA attempt (Bash pre-write).
+    await db.query.execute(sql`
+      UPDATE fup_state
+      SET normal_rate = ${plan.normalRate}, fup_date = ${today}, throttled = 0, last_updated = NOW()
+      WHERE username = ${username}
+    `);
+    const ack = await coaFanOut(cfg, db, logger, username, plan.fupRate);
+    if (ack) {
+      await setThrottled(db, username, true);
+      throttled++;
+      logger.log("THROTTLED", `${username} -> ${plan.fupRate}`);
+    } else {
+      logger.log("COA_FAILED", `${username} - will retry next cycle`);
+    }
+  }
+
+  return { examined, throttled };
+}
+
+/**
+ * Auto-unthrottle any throttled user whose FUP-Reset-Time grace has elapsed.
+ * Uses `throttled_at + resetMinutes <= now`, per the FUP-Reset-Time decision.
+ */
+export async function recoverResetTimeUsers(
+  cfg: AppConfig,
+  db: Db,
+  logger: Logger,
+): Promise<number> {
+  const throttled = await rows<{ username: string; throttled_at: Date | null }>(
+    db,
+    db.query.execute(sql`
+      SELECT username, throttled_at FROM fup_state WHERE throttled = 1
+    `),
+  );
+  let recovered = 0;
+  for (const { username, throttled_at } of throttled) {
+    const plan = await resolveUserPlan(db, username);
+    if (plan.resetMinutes == null || throttled_at == null) continue;
+    const graceMs = plan.resetMinutes * 60_000;
+    if (Date.now() - throttled_at.getTime() >= graceMs) {
+      logger.log("RESET", `${username} FUP-Reset-Time elapsed; restoring`);
+      if (await unthrottleUser(cfg, db, logger, username)) recovered++;
+    }
+  }
+  return recovered;
+}
+
 /**
  * Sum today's accumulated daily usage per user from `fup_session_state`.
  * This is what `fup-check.ts` compares against each user's quota.
