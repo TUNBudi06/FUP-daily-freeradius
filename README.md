@@ -38,7 +38,7 @@ and a MikroTik router reachable on the CoA port.
 
 ### New RADIUS attribute (FUP-Reset-Time)
 
-The migration adds `throttled_at` to `fup_session_state` so a user can be
+The migration adds `throttled_at` to `fup_state` so a user can be
 **auto-unthrottled** a fixed number of minutes after being throttled.
 
 Set `FUP-Reset-Time` (seconds are not used; the value is whole minutes) per
@@ -55,27 +55,39 @@ FUP-Reset-Time = 1440   # restore 24h after throttling
 
 ## Cron wiring
 
+Stand up the minute and daily entrypoints with the package scripts (or point
+cron directly at the files — same behaviour):
+
 ```cron
-# every minute: enforce FUP + handle FUP-Reset-Time recoveries
-* * * * * /usr/bin/bun /path/script-FUP/src/bin/fup-check.ts
-# once a day at 00:01: full reset (no CoA)
-1 0 * * * /usr/bin/bun /path/script-FUP/src/bin/fup-reset.ts
+# every minute: enforce FUP + auto-restore FUP-Reset-Time users
+* * * * * cd /path/script-FUP && /usr/bin/bun run check
+# once a day at 00:01: full quota rollover (no CoA)
+1 0 * * * cd /path/script-FUP && /usr/bin/bun run reset
 ```
 
 Optional per-user manual + CoA restore:
 
 ```bash
-bun src/bin/fup-reset.ts some-user --coa   # reset this user and CoA-restore
-bun src/bin/fup-reset.ts                    # reset everyone, no CoA
+bun run reset some-user --coa   # reset this user and CoA-restore
+bun run reset                    # reset everyone, no CoA
 ```
 
-## Entrypoints
+## Entrypoints (why two, not one)
 
-- `fup-check.ts` — acquires a single lock; per user: skips `quota ≤ 0`,
-  rolls a stale `fup_date` (NEW_DAY), throttles when `daily >= quota` (only on
-  a CoA ACK), and auto-restores FUP-Reset-Time users.
-- `fup-reset.ts` — clears `fup_date`/throttle, rebases session baselines; with
-  `--coa username` re-applies the user's `normal_rate`.
+The two entrypoints are **not** merged because they fire on different cadences:
+
+- `fup-check.ts` (minute) — throttles users whose `daily >= quota`, rolls a
+  stale `fup_date` (NEW_DAY), and **auto-restores** throttled users whose
+  `FUP-Reset-Time` grace has elapsed. This is what makes "reset after
+  throttled" dynamic — it runs every minute, so a user is unthrottled
+  immediately once their reset timer passes.
+- `fup-reset.ts` (daily 00:01) — clears `fup_date`/throttle and rebases
+  session baselines for the next day. With `--coa username` it re-applies the
+  user's `normal_rate` (used for manual restore too).
+
+Both share every decision in `ops.ts` and guard each other with the same
+filesystem lock, so the minute run and daily rollover can never write
+concurrently.
 
 ## Database migration
 
@@ -97,13 +109,55 @@ Run that on your raddb schema before deploying the .ts cronjobs.
 
 ## Verbose / debug output
 
-Set `FUP_DEBUG=1` in `.env` (or prefix the cron line) to echo every timestamped log line to stderr — useful for ad-hoc runs and verifying the minute cron without tailing the log file:
+Set `FUP_DEBUG=1` in `.env` (or prefix the command) to echo every timestamped log line to stderr — useful for ad-hoc runs and verifying the minute cron without tailing the log file:
 
 ```bash
-FUP_DEBUG=1 bun src/bin/fup-check.ts
+FUP_DEBUG=1 bun run check
 ```
 
 In cron you can keep it off (default) and rely on the log file; enable temporarily for diagnosis.
+
+## Testing
+
+Offline (no DB / router needed):
+
+```bash
+bun test        # unit tests — pure math, logger, config, rate parsing
+bunx tsc --noEmit   # type check
+```
+
+Live dry-run against a real DB — echoes every step to stderr but reviews what
+it *would* do before letting a real CoA fire:
+
+```bash
+FUP_DEBUG=1 bun run check
+```
+
+To force a test user over quota and observe a real throttle + auto-restore:
+
+```sql
+-- nothing already throttled: push the user past their daily quota
+UPDATE fup_session_state
+   SET daily_input = daily_input + 500 * 1024 * 1024
+ WHERE username = 'testuser';
+```
+
+Then run `bun run check` every minute (see FUP-Reset-Time above) and watch the
+log for `THROTTLE` → (after `FUP-Reset-Time` minutes) `RESET` restore. To test
+the restore without touching the live router first, point `FUP_NAS_IP` at an
+unreachable address so the CoA fails on purpose — the throttle will be logged
+but nothing on the router changes.
+
+## Deployment checklist
+
+1. `bun install` (Bun ≥ 1.4 required).
+2. `cp .env.example .env` and fill in DB / NAS credentials.
+3. **Apply the migration before deploying the cronjobs** (see the Database
+   migration section above): `mysql raddb < migration.sql`.
+4. Set `Max-Daily-Traffic`, `Mikrotik-Rate-Limit`, `FUP-Rate-Limit` and
+   (optional) `FUP-Reset-Time` per user/group in the RADIUS config.
+5. Install the two crons from the Cron wiring section.
+6. Tail `/var/log/fup.log` (`FUP_LOG_FILE`) for the first cycle.
 
 ## Security notes
 
