@@ -11,7 +11,7 @@ import { runCheckCycle, recoverResetTimeUsers } from "../ops.ts";
 
 async function main(): Promise<void> {
   const cfg = loadConfig(process.env);
-  const logger: Logger = createLogger(cfg.logFile);
+  const logger: Logger = createLogger(cfg.logFile, cfg.verbose);
   const lock = new Lock(cfg.lockFile);
 
   // Concurrency: the lock is held for the whole cycle. A `false` acquire means
@@ -41,8 +41,18 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  // Reaching here means config/lock/db failed before try/finally ran.
-  const logger: Logger = createLogger(process.env.FUP_LOG_FILE ?? "/tmp/fup.log");
-  logger.log("ERROR", `fup-check aborted: ${err instanceof Error ? err.message : String(err)}`);
+  // Reaching here means config/lock/db failed before try/finally ran. Drizzle
+  // wraps mysql2 errors: the query is in `message`, the real cause (e.g.
+  // "Table 'x.fup_state' doesn't exist") is on `cause` — surface both so the
+  // actual failure is never hidden.
+  const logger: Logger = createLogger(process.env.FUP_LOG_FILE ?? "/tmp/fup.log", (process.env.FUP_DEBUG ?? "0") === "1");
+  const detail =
+    err instanceof Error && (err as { cause?: unknown }).cause instanceof Error
+      ? `${(err as { cause: Error }).cause.message}`
+      : "";
+  const line = `fup-check aborted: ${err instanceof Error ? err.message : String(err)}${detail ? ` — ${detail}` : ""}`;
+  logger.log("ERROR", line);
+  // Echo to stderr so cron/terminal always sees the failure reason.
+  console.error(line);
   process.exit(1);
 });

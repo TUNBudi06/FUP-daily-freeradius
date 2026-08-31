@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createLogger } from "../src/logger.ts";
+import { createLogger, resolveLogPath } from "../src/logger.ts";
 
 describe("logger", () => {
   test("appends timestamped lines with event and message", async () => {
@@ -30,5 +30,11 @@ describe("logger", () => {
   test("survives a missing directory (writes are fire-and-forget)", () => {
     const log = createLogger("/nonexistent-dir/fup.log");
     expect(() => log.log("START", "boom")).not.toThrow();
+  });
+
+  test("resolveLogPath expands ~/ to $HOME and leaves other paths alone", () => {
+    expect(resolveLogPath("~/script-FUP/fup.log")).toBe(`${process.env.HOME}/script-FUP/fup.log`);
+    expect(resolveLogPath("/var/log/fup.log")).toBe("/var/log/fup.log");
+    expect(resolveLogPath("relative/path.log")).toBe("relative/path.log");
   });
 });

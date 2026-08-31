@@ -10,13 +10,23 @@ export interface Logger {
  * fire-and-forget; a full queue is worse than a dropped line in this context.
  * Callers must never pass secrets into `msg`.
  */
-export function createLogger(logFile: string): Logger {
+/** Expand a leading `~/` to $HOME. `.env` values are literally passed, so the shell
+ *  would otherwise create a file literally named `~`. */
+export function resolveLogPath(logFile: string): string {
+  return logFile.startsWith("~/") ? `${process.env.HOME ?? "/root"}${logFile.slice(1)}` : logFile;
+}
+
+export function createLogger(logFile: string, verbose: boolean = false): Logger {
+  const resolved = resolveLogPath(logFile);
   return {
     log(event: string, msg: string = "") {
-      const line = `[${new Date().toISOString()}] ${event}${msg === "" ? "" : ": " + msg}\n`;
-      appendFile(logFile, line).catch(() => {
+      const line = `[${new Date().toISOString()}] ${event}${msg === "" ? "" : ": " + msg}`;
+      appendFile(resolved, line + "\n").catch(() => {
         // noop: logging must never take the process down
       });
+      if (verbose) {
+        console.error(line);
+      }
     },
   };
 }

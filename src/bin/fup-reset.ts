@@ -26,7 +26,7 @@ function parseArgs(argv: string[]): Args {
 async function main(): Promise<void> {
   const { username, coa } = parseArgs(process.argv.slice(2));
   const cfg = loadConfig(process.env);
-  const logger: Logger = createLogger(cfg.logFile);
+  const logger: Logger = createLogger(cfg.logFile, cfg.verbose);
   const lock = new Lock(cfg.lockFile);
 
   // Concurrency: the lock covers the whole reset. A `false` acquire means another
@@ -58,7 +58,14 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  const logger: Logger = createLogger(process.env.FUP_LOG_FILE ?? "/tmp/fup.log");
-  logger.log("ERROR", `fup-reset aborted: ${err instanceof Error ? err.message : String(err)}`);
+  const logger: Logger = createLogger(process.env.FUP_LOG_FILE ?? "/tmp/fup.log", (process.env.FUP_DEBUG ?? "0") === "1");
+  const detail =
+    err instanceof Error && (err as { cause?: unknown }).cause instanceof Error
+      ? `${(err as { cause: Error }).cause.message}`
+      : "";
+  const line = `fup-reset aborted: ${err instanceof Error ? err.message : String(err)}${detail ? ` — ${detail}` : ""}`;
+  logger.log("ERROR", line);
+  // Echo to stderr so cron/terminal always sees the failure reason.
+  console.error(line);
   process.exit(1);
 });

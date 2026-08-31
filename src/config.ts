@@ -26,6 +26,8 @@ export interface AppConfig {
   radclientDict: string;
   /** radclient -D second dictionary directory. */
   radclientDictDir: string;
+  /** Echo every log line to console (stderr). Enabled by FUP_DEBUG=1. */
+  verbose: boolean;
 }
 
 const reIpV4 = /^(\d{1,3}\.){3}\d{1,3}$/;
@@ -75,6 +77,7 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
     radclientPath: need(env, "FUP_RADCLIENT"),
     radclientDict: need(env, "FUP_RADCLIENT_DICT"),
     radclientDictDir: need(env, "FUP_RADCLIENT_DICT_DIR"),
+    verbose: (env.FUP_DEBUG ?? "0") === "1",
   };
 }
 
@@ -94,5 +97,6 @@ export function defaultAppConfig(): AppConfig {
     FUP_RADCLIENT: "/usr/bin/radclient",
     FUP_RADCLIENT_DICT: "/usr/share/freeradius",
     FUP_RADCLIENT_DICT_DIR: "/etc/freeradius/3.0",
+    FUP_DEBUG: "0",
   });
 }

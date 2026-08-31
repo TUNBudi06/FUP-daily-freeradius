@@ -69,17 +69,31 @@ export interface UserPlan {
   normalRate: string; // rate to restore on reset
 }
 
+/**
+ * Unwrap the row list from a raw query result. For plain `sql\`...\`` queries
+ * (no drizzle field metadata), the mysql2 driver returns the `[rows, fields]`
+ * tuple untouched — the actual rows are always at index 0. `fields` is
+ * per-query metadata and is never a row list; callers must never iterate it.
+ */
+function unwrapRows(r: unknown): unknown[] {
+  if (Array.isArray(r)) {
+    // mysql2 tuple [rows, fields]; rows may itself be an array of RowDataPacket.
+    if (r.length === 2 && Array.isArray(r[0])) return r[0] as unknown[];
+    return r;
+  }
+  return [r];
+}
+
 /** Run a query and unwrap its first row (or undefined when empty). */
 async function first<T>(db: Db, q: ReturnType<typeof db.query.execute>): Promise<T | undefined> {
   const rows = await q;
-  const arr = Array.isArray(rows) ? rows : [rows];
-  return arr[0] as T | undefined;
+  return unwrapRows(rows)[0] as T | undefined;
 }
 
 /** Run a query and unwrap the full result array. */
 async function rows<T>(db: Db, q: ReturnType<typeof db.query.execute>): Promise<T[]> {
   const r = await q;
-  return (Array.isArray(r) ? r : [r]) as T[];
+  return unwrapRows(r) as T[];
 }
 
 // ----------------------------- radacct reads -----------------------------

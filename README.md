@@ -90,6 +90,21 @@ ALTER TABLE fup_state
 
 Run that on your raddb schema before deploying the .ts cronjobs.
 
+> **Note:** the Bash bootstrap inserted a resolved `normal_rate` (never NULL), but the TypeScript bootstrap seeds `NULL` (rate is resolved later, at throttle time). If your live `fup_state.normal_rate` is `NOT NULL` (the Bash-era default), apply the one-time adjustment to allow the seed:
+> ```sql
+> ALTER TABLE fup_state MODIFY normal_rate VARCHAR(64) NULL DEFAULT NULL;
+> ```
+
+## Verbose / debug output
+
+Set `FUP_DEBUG=1` in `.env` (or prefix the cron line) to echo every timestamped log line to stderr — useful for ad-hoc runs and verifying the minute cron without tailing the log file:
+
+```bash
+FUP_DEBUG=1 bun src/bin/fup-check.ts
+```
+
+In cron you can keep it off (default) and rely on the log file; enable temporarily for diagnosis.
+
 ## Security notes
 
 - radclient is spawned through an argv array (`spawn`, no shell); the CoA body
