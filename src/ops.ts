@@ -409,6 +409,35 @@ export async function runCheckCycle(
   logger: Logger,
 ): Promise<{ examined: number; throttled: number }> {
   const today = new Date().toISOString().slice(0, 10);
+
+  // Pick up any user that has an open radacct session but no fup_session_state
+  // row yet. Without this, a brand-new active user is invisible to the rest of
+  // the cycle (aggregateUsage only returns rows from fup_session_state), so
+  // their first cycle is silently skipped.
+  await db.query.execute(sql`
+    INSERT IGNORE INTO fup_session_state
+      (username, acctuniqueid, acctsessionid, framedipaddress,
+       last_input, last_output, usage_date, daily_input, daily_output, last_seen, closed)
+    SELECT
+      ra.username, ra.acctuniqueid, ra.username, '0.0.0.0',
+      ra.acctinputoctets, ra.acctoutputoctets, CURRENT_DATE, 0, 0, NOW(), 0
+    FROM radacct ra
+    WHERE ra.acctstoptime IS NULL
+      AND ra.username IS NOT NULL AND ra.username <> ''
+      AND ra.framedipaddress IS NOT NULL AND ra.framedipaddress <> ''
+      AND NOT EXISTS (
+        SELECT 1 FROM fup_session_state fss
+        WHERE fss.acctuniqueid = ra.acctuniqueid
+      )
+  `);
+
+  // Refresh per-session counters so today's deltas are accurate (handles
+  // counter-reset cases via computeDelta inside updateSessionState).
+  const active = await fetchActiveSessions(db);
+  for (const s of active) {
+    await updateSessionState(db, s);
+  }
+
   const daily = await aggregateUsage(db);
 
   // Ensure a fup_state row exists and roll a stale day over (NEW_DAY reset).
