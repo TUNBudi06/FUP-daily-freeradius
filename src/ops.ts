@@ -190,11 +190,15 @@ export async function updateSessionState(db: Db, s: SessionState): Promise<void>
 
 /**
  * Rebase open sessions to current octet counters and zero today's usage; zero
- * closed sessions. Called at midnight and at quota reset so a fresh daily quota
- * starts from zero. Mirrors the Bash reset block.
+ * every remaining row regardless of session state. Called at midnight and at
+ * quota reset so a fresh daily quota starts from zero for every user, even
+ * those whose radacct session is closed or unmatched. Mirrors the Bash reset
+ * block.
  */
 export async function rebaseSessionBaselines(db: Db, username?: string): Promise<void> {
   const userCond = username ? sql`AND fss.username = ${username}` : sql``;
+  // 1) Open sessions: rebase the baseline to the router's live counters so the
+  //    next cycle's delta continues from the current position, and zero daily.
   await db.query.execute(sql`
     UPDATE fup_session_state fss
     JOIN radacct ra ON ra.acctuniqueid = fss.acctuniqueid AND ra.acctstoptime IS NULL
@@ -207,10 +211,13 @@ export async function rebaseSessionBaselines(db: Db, username?: string): Promise
         fss.closed = 0
     ${userCond}
   `);
+  // 2) Every row that did not match an open session (closed/mismatched/ghost):
+  //    zero the daily counters unconditionally. A reset must bring ALL users
+  //    back to 0, not just those with a live radacct join.
   await db.query.execute(sql`
     UPDATE fup_session_state
     SET daily_input = 0, daily_output = 0, usage_date = CURRENT_DATE
-    WHERE closed = 1 ${username ? sql`AND username = ${username}` : sql``}
+    ${username ? sql`WHERE username = ${username}` : sql``}
   `);
 }
 
@@ -474,7 +481,7 @@ export async function recoverResetTimeUsers(
       continue;
     }
     const plan = await resolveUserPlan(db, username);
-    if (plan.resetMinutes == null || throttled_at == null) continue;
+    if (plan.resetMinutes == null || plan.resetMinutes <= 0 || throttled_at == null) continue;
     const graceMs = plan.resetMinutes * 60_000;
     if (Date.now() - throttled_at.getTime() >= graceMs) {
       logger.log("RESET", `${username} FUP-Reset-Time elapsed; restoring`);

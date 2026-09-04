@@ -51,11 +51,16 @@ export async function sendCoa(
   rate: string,
   channel: "throttle" | "restore",
 ): Promise<CoaResult> {
-  const proc = spawn(buildCoaArgv(cfg), {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  }) as Subprocess<"pipe", "pipe", "pipe">;
+  let proc: Subprocess<"pipe", "pipe", "pipe">;
+  try {
+    proc = spawn(buildCoaArgv(cfg), {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    }) as Subprocess<"pipe", "pipe", "pipe">;
+  } catch (e) {
+    return { channel, ok: false, detail: `spawn failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
 
   proc.stdin!.write(new TextEncoder().encode(buildCoaBody(username, ip, rate)));
   proc.stdin!.end();
