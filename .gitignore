@@ -6,3 +6,4 @@ dist/
 *.log
 *.lock
 .DS_Store
+.idea/

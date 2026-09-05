@@ -120,6 +120,37 @@ FUP-Reset-Time = 1440   # restore 24h after throttling
 - Requires a `normal_rate` (the checked `Mikrotik-Rate-Limit`), else the
   restore is skipped with an `ERROR` log.
 
+### Per-device FUP mode (FUP-Per-Device)
+
+By default, when a user crosses `Max-Daily-Traffic`, **every** active session
+for that username is CoA-throttled. For household plans that's too blunt —
+a kid's tablet burning the quota shouldn't slow the parent's laptop.
+
+Set `FUP-Per-Device=1` (truthy values: `1` / `true` / `yes` / `on`,
+case-insensitive) on a user or plan group to switch to **per-device** quota
+evaluation. Each live session is checked independently, and only the
+specific framed IP whose own `daily_input + daily_output` crosses the cap
+is CoA-throttled. Siblings for the same username keep `Mikrotik-Rate-Limit`
+until either the daily reset, the device's own `FUP-Reset-Time` grace
+elapses, or an operator runs `fup-reset <user>` (which restores **every**
+throttled device for the user).
+
+State is tracked in a join table `fup_state_throttled (PK username,
+acctuniqueid)`. The user-level `fup_state.throttled` flag is the
+**recomputed aggregate** — `1` when at least one row exists, `0` when
+empty, with `throttled_at = MIN(throttled_at)` across the live rows.
+
+| Attribute | Value | Mode |
+|---|---|---|
+| (unset) / `0` | **per-user** (default) | Every device for the username throttled together |
+| `1` / `true` / `yes` / `on` | **per-device** | Only the offending `(username, acctuniqueid)` throttled |
+
+Full reference (edge cases, mode transitions, dictionary registration,
+SQL recipes, troubleshooting) is in **[ATTRIBUTES.md §1.5](ATTRIBUTES.md)**.
+Per-device mode is enabled per user or per group — same `radreply` /
+`radgroupreply` tables, no extra UI changes in daloRADIUS beyond adding
+the attribute name to its dictionary (see ATTRIBUTES.md §3.1).
+
 ## Build (single-file binaries)
 
 `bun run build` compiles both entrypoints into standalone executables via
@@ -209,6 +240,13 @@ Run that on your raddb schema before deploying the .ts cronjobs.
 > ALTER TABLE fup_state MODIFY normal_rate VARCHAR(64) NULL DEFAULT NULL;
 > ```
 
+> **Per-device FUP:** `migration.sql` also creates `fup_state_throttled`
+> (`CREATE TABLE IF NOT EXISTS`). Run `mysql raddb < migration.sql` once
+> before flipping any plan to per-device mode (i.e. before setting
+> `FUP-Per-Device=1` on a user or group). The migration is additive and
+> safe to re-run. See [ATTRIBUTES.md §1.5](ATTRIBUTES.md) for the full
+> pre-flight checklist.
+
 ## Verbose / debug output
 
 Set `FUP_DEBUG=1` in `.env` (or prefix the command) to echo every timestamped log line to stderr — useful for ad-hoc runs and verifying the minute cron without tailing the log file:
@@ -261,7 +299,9 @@ Follow the detailed [DEPLOY.md](DEPLOY.md) guide. Quick version:
 3. **Apply the migration before deploying the cronjobs** (see the Database
    migration section above and DEPLOY.md §4): `mysql raddb < migration.sql`.
 4. Set `Max-Daily-Traffic`, `Mikrotik-Rate-Limit`, `FUP-Rate-Limit` and
-   (optional) `FUP-Reset-Time` per user/group in the RADIUS config.
+   (optional) `FUP-Reset-Time` per user/group in the RADIUS config. To
+   enable per-device quota evaluation, additionally set `FUP-Per-Device=1`
+   (see "Per-device FUP mode" above).
 5. Install the two crons from the Cron wiring section (see DEPLOY.md §6) —
    preferably the compiled binaries (`dist/fup-check`, `dist/fup-reset`) so a
    server with no Bun/node_modules can still run them.
