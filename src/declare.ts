@@ -11,6 +11,11 @@ export const ATTR = {
   FUP_RATE: "FUP-Rate-Limit",
   /** Minutes of grace before auto-unthrottle after a throttle. */
   FUP_RESET_TIME: "FUP-Reset-Time",
+  /** Per-device FUP switch. Truthy: each device's own session is evaluated
+   *  against the quota independently; only the specific framed IP that
+   *  crosses the cap is CoA-throttled. Falsy (default): per-user aggregate
+   *  (every device for the username is throttled together). */
+  FUP_PER_DEVICE: "FUP-Per-Device",
 } as const;
 
 /** Fallback order for resolving the FUP rate: entry group then per-user, check before reply. */

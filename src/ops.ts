@@ -17,6 +17,15 @@ import { sendCoa } from "./coa.ts";
 /** Word-chars plus the few safe separators allowed in a radius username. */
 const reUser = /^[\w@.\-]+$/;
 
+/** Truthy values accepted for the FUP-Per-Device attribute. Case-insensitive
+ *  and trim-tolerant. Anything else (including "0", "false", blank, unset)
+ *  is treated as off. */
+function isPerDeviceTruthy(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const v = value.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 /**
  * Redact every occurrence of any secret with `***`. Split/join (not regex) so
  * secret content containing regex metacharacters is still fully replaced.
@@ -67,6 +76,7 @@ export interface UserPlan {
   fupRate: string; // rate to enforce when throttled
   resetMinutes: number | null; // FUP-Reset-Time minutes; null = no auto-reset
   normalRate: string; // rate to restore on reset
+  perDevice: boolean; // FUP-Per-Device: quota evaluated per session, not per user
 }
 
 /**
@@ -219,6 +229,22 @@ export async function rebaseSessionBaselines(db: Db, username?: string): Promise
     SET daily_input = 0, daily_output = 0, usage_date = CURRENT_DATE
     ${username ? sql`WHERE username = ${username}` : sql``}
   `);
+  // 3) Per-device join table: a daily reset clears ALL throttled device
+  //    slots for the user (or globally). Per-device rows are tied to
+  //    daily usage; a new day means a fresh slate. The user-level
+  //    fup_state.throttled flag will be recomputed via
+  //    recomputeUserThrottleFlag on the next runPerDeviceCheck, or set
+  //    directly here when resetting globally (no username given).
+  if (username) {
+    await db.query.execute(sql`
+      DELETE FROM fup_state_throttled WHERE username = ${username}
+    `);
+  } else {
+    await db.query.execute(sql`TRUNCATE TABLE fup_state_throttled`);
+    await db.query.execute(sql`
+      UPDATE fup_state SET throttled = 0, throttled_at = NULL, last_updated = NOW()
+    `);
+  }
 }
 
 // ----------------------------- attribute resolution -----------------------------
@@ -277,6 +303,7 @@ export async function resolveUserPlan(db: Db, username: string): Promise<UserPla
   const maxDaily = await resolveAttr(db, username, ATTR.MAX_DAILY);
   const fupRate = await resolveAttr(db, username, ATTR.FUP_RATE);
   const resetMin = await resolveAttr(db, username, ATTR.FUP_RESET_TIME);
+  const perDeviceRaw = await resolveAttr(db, username, ATTR.FUP_PER_DEVICE);
   const quota = asBig(maxDaily);
   const normalRate = await resolveNormalRate(db, username);
   return {
@@ -284,6 +311,7 @@ export async function resolveUserPlan(db: Db, username: string): Promise<UserPla
     fupRate: fupRate && fupRate !== "0" ? fupRate : DEFAULT_FUP_RATE,
     resetMinutes: resetMin && /^\d+$/.test(resetMin) ? Number(resetMin) : null,
     normalRate: normalRate ?? "",
+    perDevice: isPerDeviceTruthy(perDeviceRaw),
   };
 }
 
@@ -351,6 +379,34 @@ export async function unthrottleUser(
   logger: Logger,
   username: string,
 ): Promise<boolean> {
+  const plan = await resolveUserPlan(db, username);
+
+  // Per-device: restore each throttled device independently. Operator intent
+  // for "reset this user" is "clear every device", not just one — so we
+  // iterate the join table and CoA each IP back to the normal rate.
+  if (plan.perDevice) {
+    const join = await loadThrottledJoin(db, username);
+    if (join.length === 0) {
+      // Nothing to restore per-device, but the user-level flag may still
+      // be set from a previous run. Self-heal so subsequent cycles start
+      // clean.
+      await selfHealThrottleFlag(db, username);
+      return true;
+    }
+    const normal = plan.normalRate || (await resolveNormalRate(db, username)) || "";
+    if (!normal) {
+      logger.log("ERROR", `no normal rate for ${username}`);
+      return false;
+    }
+    let anyAck = false;
+    for (const j of join) {
+      if (await unthrottleOne(cfg, db, logger, username, j.acctuniqueid, j.framedipaddress, normal)) {
+        anyAck = true;
+      }
+    }
+    return anyAck;
+  }
+
   const normal = await resolveNormalRate(db, username);
   if (!normal) {
     logger.log("ERROR", `no normal rate for ${username}`);
@@ -395,6 +451,237 @@ export async function fetchThrottleState(db: Db, username: string): Promise<Thro
     fupDate: row?.fup_date ?? null,
     throttledAt: row?.throttled_at ?? null,
   };
+}
+
+// --------------------------- per-device FUP mode ---------------------------
+
+/** One open session in the per-device loop: fup_session_state row joined
+ *  to radacct for the live IP and stop-null check. */
+interface PerDeviceRow {
+  acctuniqueid: string;
+  framedipaddress: string;
+  dailyInput: bigint;
+  dailyOutput: bigint;
+}
+
+/** A throttled-session row from `fup_state_throttled`. */
+interface ThrottledJoinRow {
+  acctuniqueid: string;
+  framedipaddress: string;
+  throttledAt: Date;
+  throttledRate: string;
+}
+
+/** Load open sessions for a user from fup_session_state + radacct. The CoA
+ *  target is always the live IP from radacct; fup_session_state.framedipaddress
+ *  is only a stale cache. Sessions missing a valid IP or already closed on
+ *  the NAS are filtered out so we never CoA a dead session. */
+async function loadPerDeviceRows(db: Db, username: string): Promise<PerDeviceRow[]> {
+  const res = await rows<{
+    acctuniqueid: string;
+    framedipaddress: string;
+    daily_input: unknown;
+    daily_output: unknown;
+  }>(
+    db,
+    db.query.execute(sql`
+      SELECT fss.acctuniqueid, ra.framedipaddress,
+             fss.daily_input, fss.daily_output
+      FROM fup_session_state fss
+      JOIN radacct ra ON ra.acctuniqueid = fss.acctuniqueid
+      WHERE fss.username = ${username}
+        AND ra.acctstoptime IS NULL
+        AND ra.framedipaddress IS NOT NULL AND ra.framedipaddress <> ''
+    `),
+  );
+  const out: PerDeviceRow[] = [];
+  for (const r of res) {
+    if (!isValidIp(r.framedipaddress)) continue;
+    out.push({
+      acctuniqueid: r.acctuniqueid,
+      framedipaddress: r.framedipaddress,
+      dailyInput: asBig(r.daily_input),
+      dailyOutput: asBig(r.daily_output),
+    });
+  }
+  return out;
+}
+
+/** Load currently throttled (user, session) join rows for one user. */
+async function loadThrottledJoin(db: Db, username: string): Promise<ThrottledJoinRow[]> {
+  return rows<{ acctuniqueid: string; framedipaddress: string; throttled_at: Date; throttled_rate: string }>(
+    db,
+    db.query.execute(sql`
+      SELECT acctuniqueid, framedipaddress, throttled_at, throttled_rate
+      FROM fup_state_throttled WHERE username = ${username}
+    `),
+  );
+}
+
+/** Self-heal: if fup_state says throttled=1 but the per-device table is
+ *  empty (or has no live sessions left), clear the user-level flag. */
+async function selfHealThrottleFlag(db: Db, username: string): Promise<boolean> {
+  const r = await first<{ hasRows: unknown }>(
+    db,
+    db.query.execute(sql`
+      SELECT COUNT(*) > 0 AS hasRows
+      FROM fup_state_throttled WHERE username = ${username}
+    `),
+  );
+  if (asBig(r?.hasRows) === 0n) {
+    await db.query.execute(sql`
+      UPDATE fup_state
+      SET throttled = 0, throttled_at = NULL, last_updated = NOW()
+      WHERE username = ${username}
+    `);
+    return true;
+  }
+  return false;
+}
+
+/** Stale-clear: drop join rows whose radacct session is no longer open. */
+async function clearStaleJoinRows(db: Db, username: string, logger: Logger): Promise<number> {
+  const res = await db.query.execute(sql`
+    DELETE t FROM fup_state_throttled t
+    LEFT JOIN radacct ra ON ra.acctuniqueid = t.acctuniqueid
+    WHERE t.username = ${username}
+      AND (ra.acctuniqueid IS NULL OR ra.acctstoptime IS NOT NULL)
+  `);
+  // mysql2 OkPacket has `affectedRows` on success.
+  const affected = Number((res as { affectedRows?: number })?.affectedRows ?? 0);
+  if (affected > 0) logger.log("STALE_THROTTLE_CLEARED", `${username} removed=${affected}`);
+  return affected;
+}
+
+/** Recompute the user-level throttled/throttled_at from the join table. */
+async function recomputeUserThrottleFlag(db: Db, username: string): Promise<void> {
+  await db.query.execute(sql`
+    UPDATE fup_state fs
+    LEFT JOIN (
+      SELECT username, MIN(throttled_at) AS min_at, COUNT(*) AS cnt
+      FROM fup_state_throttled GROUP BY username
+    ) t ON t.username = fs.username
+    SET fs.throttled = CASE WHEN COALESCE(t.cnt, 0) > 0 THEN 1 ELSE 0 END,
+        fs.throttled_at = t.min_at,
+        fs.last_updated = NOW()
+    WHERE fs.username = ${username}
+  `);
+}
+
+/** CoA a single (user, IP) to the normal rate; on ACK, delete the matching
+ *  join row and recompute the user-level flag. Returns true on ACK. */
+export async function unthrottleOne(
+  cfg: AppConfig,
+  db: Db,
+  logger: Logger,
+  username: string,
+  acctuniqueid: string,
+  ip: string,
+  normalRate: string,
+): Promise<boolean> {
+  if (!isValidIp(ip)) {
+    logger.log("SKIP", `${username} invalid IP ${ip} (unthrottleOne)`);
+    return false;
+  }
+  const res = await sendCoa(cfg, username, ip, normalRate, "restore");
+  const secrets = [cfg.nas.secret, cfg.db.password];
+  logger.log(
+    res.ok ? "COA_ACK" : "COA_FAILED",
+    redact(`${username} acct=${acctuniqueid} IP=${ip} -> ${normalRate} (${res.detail})`, secrets),
+  );
+  if (!res.ok) return false;
+  await db.query.execute(sql`
+    DELETE FROM fup_state_throttled
+    WHERE username = ${username} AND acctuniqueid = ${acctuniqueid}
+  `);
+  await recomputeUserThrottleFlag(db, username);
+  logger.log("RESTORE", `${username} ${ip} -> ${normalRate} (per_device)`);
+  return true;
+}
+
+/**
+ * Per-device check loop. Each session's own daily_input+daily_output is
+ * compared against the quota; only the specific IP that crosses the cap is
+ * CoA-throttled. In-cycle unthrottle restores a session whose usage has
+ * dropped (e.g. daily reset zeroed the join row's siblings).
+ */
+export async function runPerDeviceCheck(
+  cfg: AppConfig,
+  db: Db,
+  logger: Logger,
+  username: string,
+  plan: UserPlan,
+): Promise<{ throttled: number; restored: number }> {
+  let throttled = 0;
+  let restored = 0;
+
+  // Edge 10: fup_state says throttled but no join rows. Clear and log.
+  await selfHealThrottleFlag(db, username);
+  // Edge 3: drop join rows whose radacct session is no longer open.
+  await clearStaleJoinRows(db, username, logger);
+
+  const live = await loadPerDeviceRows(db, username);
+  const liveByAcct = new Map(live.map((r) => [r.acctuniqueid, r]));
+  const join = await loadThrottledJoin(db, username);
+
+  // Step A: in-cycle unthrottle for join rows whose session is now under quota
+  // (or whose session is gone — stale-cleared above).
+  for (const j of join) {
+    const live2 = liveByAcct.get(j.acctuniqueid);
+    const use = live2 ? live2.dailyInput + live2.dailyOutput : 0n;
+    // No live row OR under quota: restore.
+    if (!live2 || !isQuotaReached(use, plan.quota)) {
+      const normal = plan.normalRate || (await resolveNormalRate(db, username)) || "";
+      if (!normal) continue;
+      if (await unthrottleOne(cfg, db, logger, username, j.acctuniqueid, j.framedipaddress, normal)) {
+        restored++;
+      }
+    }
+  }
+
+  // Reload join rows after the unthrottle pass.
+  const joinAfter = new Set((await loadThrottledJoin(db, username)).map((j) => j.acctuniqueid));
+
+  // Step B: per-row throttle. A session trips if its own daily use >= quota
+  // and it is not already in the join table.
+  for (const row of live) {
+    if (joinAfter.has(row.acctuniqueid)) continue;
+    const use = row.dailyInput + row.dailyOutput;
+    if (!isQuotaReached(use, plan.quota)) continue;
+
+    logger.log("FUP_REACHED", `${username} ${row.framedipaddress} (usage=${use} >= quota=${plan.quota})`);
+    // Prime normal_rate + throttled=0 (Bash pre-write compatibility).
+    await db.query.execute(sql`
+      UPDATE fup_state
+      SET normal_rate = ${plan.normalRate}, throttled = 0, last_updated = NOW()
+      WHERE username = ${username}
+    `);
+    const res = await sendCoa(cfg, username, row.framedipaddress, plan.fupRate, "throttle");
+    const secrets = [cfg.nas.secret, cfg.db.password];
+    logger.log(
+      res.ok ? "COA_ACK" : "COA_FAILED",
+      redact(`${username} IP=${row.framedipaddress} -> ${plan.fupRate} (${res.detail})`, secrets),
+    );
+    if (!res.ok) {
+      logger.log("COA_FAILED", `${username} ${row.framedipaddress} - will retry next cycle`);
+      continue;
+    }
+    await db.query.execute(sql`
+      INSERT INTO fup_state_throttled
+        (username, acctuniqueid, framedipaddress, throttled_at, throttled_rate)
+      VALUES
+        (${username}, ${row.acctuniqueid}, ${row.framedipaddress}, NOW(), ${plan.fupRate})
+      ON DUPLICATE KEY UPDATE
+        framedipaddress = VALUES(framedipaddress),
+        throttled_at = VALUES(throttled_at),
+        throttled_rate = VALUES(throttled_rate)
+    `);
+    await recomputeUserThrottleFlag(db, username);
+    throttled++;
+    logger.log("THROTTLED", `${username} ${row.framedipaddress} -> ${plan.fupRate} (reason=per_device_quota)`);
+  }
+
+  return { throttled, restored };
 }
 
 /**
@@ -464,6 +751,23 @@ export async function runCheckCycle(
     const plan = await resolveUserPlan(db, username);
     if (plan.quota <= 0n) continue;
     logger.log("DAILY_USAGE", `${username} = ${use.dailyInput +use.dailyOutput} bytes (quota=${plan.quota})`);
+
+    if (plan.perDevice) {
+      // Per-device mode: each session evaluated independently. The aggregate
+      // in `use` is informational; the actual decision is row-by-row inside.
+      logger.log("PER_DEVICE_ACTIVE", `${username} (quota=${plan.quota} per device)`);
+      const r = await runPerDeviceCheck(cfg, db, logger, username, plan);
+      throttled += r.throttled;
+      continue;
+    }
+
+    // Edge 2: user transitioned from per-device to per-user mode. Drop any
+    // join rows; the aggregate path below re-throttles the user as a whole
+    // if still over quota.
+    await db.query.execute(sql`
+      DELETE FROM fup_state_throttled WHERE username = ${username}
+    `);
+
     const state = await fetchThrottleState(db, username);
     if (state.throttled) continue;
     if (!isQuotaReached(use.dailyInput + use.dailyOutput, plan.quota)) continue;
@@ -512,6 +816,34 @@ export async function recoverResetTimeUsers(
     const plan = await resolveUserPlan(db, username);
     if (plan.resetMinutes == null || plan.resetMinutes <= 0 || throttled_at == null) continue;
     const graceMs = plan.resetMinutes * 60_000;
+
+    if (plan.perDevice) {
+      // Per-device: FUP-Reset-Time applies to each device's own throttle
+      // timestamp. A device whose throttled_at + resetMinutes <= now is
+      // restored independently. The user-level throttled_at (MIN of all
+      // join rows) drives the iteration; per-row grace is checked against
+      // each row's own throttled_at.
+      const join = await loadThrottledJoin(db, username);
+      if (join.length === 0) {
+        // Stale flag without rows: clear and move on.
+        await selfHealThrottleFlag(db, username);
+        continue;
+      }
+      const normal = plan.normalRate || (await resolveNormalRate(db, username)) || "";
+      if (!normal) continue;
+      let userRecovered = false;
+      for (const j of join) {
+        const rowMs = j.throttled_at instanceof Date ? j.throttled_at.getTime() : new Date(j.throttled_at).getTime();
+        if (Date.now() - rowMs < graceMs) continue;
+        logger.log("RESET", `${username} ${j.framedipaddress} FUP-Reset-Time elapsed; restoring`);
+        if (await unthrottleOne(cfg, db, logger, username, j.acctuniqueid, j.framedipaddress, normal)) {
+          userRecovered = true;
+        }
+      }
+      if (userRecovered) recovered++;
+      continue;
+    }
+
     if (Date.now() - throttled_at.getTime() >= graceMs) {
       logger.log("RESET", `${username} FUP-Reset-Time elapsed; restoring`);
       if (await unthrottleUser(cfg, db, logger, username)) recovered++;
