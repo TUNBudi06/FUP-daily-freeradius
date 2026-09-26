@@ -41,3 +41,18 @@ export function isQuotaReached(daily: bigint, quota: bigint): boolean {
 export function validCoaRate(rate: string): boolean {
   return isMikrotikRate(rate);
 }
+
+const reUser = /^[\w@.\-]+$/;
+
+/**
+ * True when `u` is a safe radius username: 1..64 chars, no control characters,
+ * and only word chars plus `@`, `.`, `-`.
+ */
+export function validUser(u: string): boolean {
+  if (!u || u.length > 64) return false;
+  for (let i = 0; i < u.length; i++) {
+    const c = u.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return false;
+  }
+  return reUser.test(u);
+}

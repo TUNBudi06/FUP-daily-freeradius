@@ -10,12 +10,9 @@ import { isValidIp } from "./config.ts";
 import type { Logger } from "./logger.ts";
 import type { Db } from "./db.ts";
 import { sql } from "drizzle-orm";
-import { ATTR, DEFAULT_FUP_RATE } from "./declare.ts";
-import { asBig, computeDelta, isQuotaReached } from "./fup.ts";
+import { ATTR, DEFAULT_FUP_RATE, isSafeRateString } from "./declare.ts";
+import { asBig, computeDelta, isQuotaReached, validUser } from "./fup.ts";
 import { sendCoa } from "./coa.ts";
-
-/** Word-chars plus the few safe separators allowed in a radius username. */
-const reUser = /^[\w@.\-]+$/;
 
 /** Truthy values accepted for the FUP-Per-Device attribute. Case-insensitive
  *  and trim-tolerant. Anything else (including "0", "false", blank, unset)
@@ -40,21 +37,7 @@ export function redact(value: string, secrets: string[]): string {
   return out;
 }
 
-/**
- * True when `u` is a safe radius username: 1..64 chars, no control characters,
- * and only word chars plus `@`, `.`, `-`. Used to skip malformed rows before
- * any logging or CoA.
- */
-export function validUser(u: string): boolean {
-  if (!u || u.length > 64 || u.length === 0) return false;
-  const first = u.charCodeAt(0);
-  if (first < 0x20 || first === 0x7f) return false;
-  for (let i = 0; i < u.length; i++) {
-    const c = u.charCodeAt(i);
-    if (c < 0x20 || c === 0x7f) return false;
-  }
-  return reUser.test(u);
-}
+export { validUser };
 
 /** One active accounting session pulled from `radacct`. */
 export interface SessionState {
@@ -106,6 +89,41 @@ async function rows<T>(db: Db, q: ReturnType<typeof db.query.execute>): Promise<
   return unwrapRows(r) as T[];
 }
 
+// ----------------------------- day boundary -----------------------------
+
+/**
+ * Normalise a DATE-ish driver value to `YYYY-MM-DD`. mysql2 hands back a
+ * `Date` (in process-local time) for DATE columns and a string for VARCHAR
+ * ones; comparing either against a plain string must never spuriously differ.
+ */
+export function normalizeDay(v: unknown): string | null {
+  if (v instanceof Date) {
+    if (!Number.isFinite(v.getTime())) return null;
+    const m = String(v.getMonth() + 1).padStart(2, "0");
+    const d = String(v.getDate()).padStart(2, "0");
+    return `${v.getFullYear()}-${m}-${d}`;
+  }
+  if (typeof v === "string") {
+    const m = /^\d{4}-\d{2}-\d{2}/.exec(v.trim());
+    return m ? m[0] : null;
+  }
+  return null;
+}
+
+/**
+ * "Today" as the DATABASE sees it. The reset cron stamps rows with SQL
+ * `CURRENT_DATE` (DB timezone); deriving the day from JS `toISOString()` (UTC)
+ * disagrees for hours every night on a non-UTC server, which made every check
+ * cycle treat the day as rolled over and wipe usage/throttle state.
+ */
+export async function dbToday(db: Db): Promise<string> {
+  const r = await first<{ d: unknown }>(
+    db,
+    db.query.execute(sql`SELECT DATE_FORMAT(CURRENT_DATE, '%Y-%m-%d') AS d`),
+  );
+  return normalizeDay(r?.d) ?? normalizeDay(new Date())!;
+}
+
 // ----------------------------- radacct reads -----------------------------
 
 /** Active (open) sessions: no stop time, valid username + framed IP. */
@@ -154,10 +172,10 @@ export async function activeSessionIps(db: Db, username: string): Promise<string
  * counter-reset aware (see `computeDelta`). On a new day the daily counters are
  * zeroed so today's usage starts fresh. Mirrors the Bash UPSERT block.
  */
-export async function updateSessionState(db: Db, s: SessionState): Promise<void> {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD usage_date
+export async function updateSessionState(db: Db, s: SessionState, todayArg?: string): Promise<void> {
+  const today = todayArg ?? (await dbToday(db));
 
-  const prior = await first<{ last_input: unknown; last_output: unknown; daily_input: unknown; daily_output: unknown; usage_date: string }>(
+  const prior = await first<{ last_input: unknown; last_output: unknown; daily_input: unknown; daily_output: unknown; usage_date: unknown }>(
     db,
     db.query.execute(sql`
       SELECT last_input, last_output, daily_input, daily_output, usage_date
@@ -169,7 +187,7 @@ export async function updateSessionState(db: Db, s: SessionState): Promise<void>
   const lastOutput = prior ? asBig(prior.last_output) : 0n;
   let dailyInput = prior ? asBig(prior.daily_input) : 0n;
   let dailyOutput = prior ? asBig(prior.daily_output) : 0n;
-  const usageDate = prior?.usage_date || today;
+  const usageDate = normalizeDay(prior?.usage_date) || today;
 
   if (usageDate !== today) {
     // NEW_DAY: rebase baseline and zero today's usage.
@@ -180,6 +198,18 @@ export async function updateSessionState(db: Db, s: SessionState): Promise<void>
     dailyOutput += computeDelta(s.output, lastOutput);
   }
 
+  if (prior) {
+    // Plain UPDATE: does not depend on a UNIQUE key on acctuniqueid existing
+    // (an upsert without one would insert a duplicate row every cycle).
+    await db.query.execute(sql`
+      UPDATE fup_session_state
+      SET last_input = ${s.input}, last_output = ${s.output},
+          usage_date = ${today}, daily_input = ${dailyInput}, daily_output = ${dailyOutput},
+          last_seen = NOW(), closed = 0
+      WHERE acctuniqueid = ${s.acctuniqueid}
+    `);
+    return;
+  }
   await db.query.execute(sql`
     INSERT INTO fup_session_state
       (username, acctuniqueid, acctsessionid, framedipaddress,
@@ -199,6 +229,25 @@ export async function updateSessionState(db: Db, s: SessionState): Promise<void>
 }
 
 /**
+ * Rebase ONE session to its live octet counters and zero its daily usage.
+ * Used when a single throttled device is restored so it is not instantly
+ * re-throttled by usage it already paid for.
+ */
+export async function rebaseSession(db: Db, acctuniqueid: string): Promise<void> {
+  await db.query.execute(sql`
+    UPDATE fup_session_state fss
+    JOIN radacct ra ON ra.acctuniqueid = fss.acctuniqueid
+    SET fss.last_input = COALESCE(ra.acctinputoctets, 0),
+        fss.last_output = COALESCE(ra.acctoutputoctets, 0),
+        fss.daily_input = 0,
+        fss.daily_output = 0,
+        fss.usage_date = CURRENT_DATE,
+        fss.last_seen = NOW()
+    WHERE fss.acctuniqueid = ${acctuniqueid}
+  `);
+}
+
+/**
  * Rebase open sessions to current octet counters and zero today's usage; zero
  * every remaining row regardless of session state. Called at midnight and at
  * quota reset so a fresh daily quota starts from zero for every user, even
@@ -206,7 +255,7 @@ export async function updateSessionState(db: Db, s: SessionState): Promise<void>
  * block.
  */
 export async function rebaseSessionBaselines(db: Db, username?: string): Promise<void> {
-  const userCond = username ? sql`AND fss.username = ${username}` : sql``;
+  const userCond = username ? sql`WHERE fss.username = ${username}` : sql``;
   // 1) Open sessions: rebase the baseline to the router's live counters so the
   //    next cycle's delta continues from the current position, and zero daily.
   await db.query.execute(sql`
@@ -240,7 +289,7 @@ export async function rebaseSessionBaselines(db: Db, username?: string): Promise
       DELETE FROM fup_state_throttled WHERE username = ${username}
     `);
   } else {
-    await db.query.execute(sql`TRUNCATE TABLE fup_state_throttled`);
+    await db.query.execute(sql`DELETE FROM fup_state_throttled`);
     await db.query.execute(sql`
       UPDATE fup_state SET throttled = 0, throttled_at = NULL, last_updated = NOW()
     `);
@@ -284,7 +333,11 @@ async function resolveAttr(db: Db, username: string, attr: string): Promise<stri
 
 /** Normal (un-throttled) rate for a user, or null when none is configured. */
 export async function resolveNormalRate(db: Db, username: string): Promise<string | null> {
-  // Prefer what we last enforced and saved in fup_state.
+  // The configured attribute wins so a plan change (10M -> 20M) is picked up;
+  // the value saved in fup_state is only a fallback (e.g. attribute removed
+  // while the user was throttled).
+  const fromAttr = (await resolveAttr(db, username, ATTR.RATE))?.trim();
+  if (fromAttr && isSafeRateString(fromAttr)) return fromAttr;
   const fromState = await first<{ normal_rate: string }>(
     db,
     db.query.execute(sql`
@@ -293,9 +346,8 @@ export async function resolveNormalRate(db: Db, username: string): Promise<strin
         AND normal_rate <> '' AND normal_rate <> '0' LIMIT 1
     `),
   );
-  if (fromState?.normal_rate) return fromState.normal_rate;
-  // Fall back to the checked attribute (radcheck/radreply).
-  return (await resolveAttr(db, username, ATTR.RATE).then((v) => v ?? null)) ?? null;
+  const saved = fromState?.normal_rate?.trim();
+  return saved && isSafeRateString(saved) ? saved : null;
 }
 
 /** Read a user's daily quota, enforce rate, and optional reset time. */
@@ -306,10 +358,12 @@ export async function resolveUserPlan(db: Db, username: string): Promise<UserPla
   const perDeviceRaw = await resolveAttr(db, username, ATTR.FUP_PER_DEVICE);
   const quota = asBig(maxDaily);
   const normalRate = await resolveNormalRate(db, username);
+  const fupRateTrim = fupRate?.trim();
   return {
     quota,
-    fupRate: fupRate && fupRate !== "0" ? fupRate : DEFAULT_FUP_RATE,
-    resetMinutes: resetMin && /^\d+$/.test(resetMin) ? Number(resetMin) : null,
+    // An unsafe (quote/newline/etc.) value can never reach radclient's stdin.
+    fupRate: fupRateTrim && fupRateTrim !== "0" && isSafeRateString(fupRateTrim) ? fupRateTrim : DEFAULT_FUP_RATE,
+    resetMinutes: resetMin && /^\d+$/.test(resetMin.trim()) ? Number(resetMin.trim()) : null,
     normalRate: normalRate ?? "",
     perDevice: isPerDeviceTruthy(perDeviceRaw),
   };
@@ -358,7 +412,7 @@ export async function coaFanOut(
       logger.log("SKIP", `${username} invalid IP ${ip}`);
       continue;
     }
-    const res = await sendCoa(cfg, username, ip, rate, "throttle");
+    const res = await sendCoa(cfg, logger, username, ip, rate, "throttle");
     logger.log(
       res.ok ? "COA_ACK" : "COA_FAILED",
       redact(`${username} IP=${ip} -> ${rate} (${res.detail})`, secrets),
@@ -371,7 +425,12 @@ export async function coaFanOut(
 /**
  * Restore a user by CoA'ing their normal rate, then clear throttle and rebase
  * their session baselines so the next daily quota starts from zero. Shared by
- * the reset entrypoint and the FUP-Reset-Time auto-unthrottle.
+ * the reset entrypoint, the FUP-Reset-Time auto-unthrottle and day rollover.
+ *
+ * Returns true when the user is no longer throttled (restored, or nothing to
+ * restore because they have no live session). Returns false — leaving the
+ * throttle flag intact so the next cycle retries — when a CoA was needed and
+ * failed, or no normal rate is known.
  */
 export async function unthrottleUser(
   cfg: AppConfig,
@@ -385,6 +444,7 @@ export async function unthrottleUser(
   // for "reset this user" is "clear every device", not just one — so we
   // iterate the join table and CoA each IP back to the normal rate.
   if (plan.perDevice) {
+    await clearStaleJoinRows(db, username, logger);
     const join = await loadThrottledJoin(db, username);
     if (join.length === 0) {
       // Nothing to restore per-device, but the user-level flag may still
@@ -398,25 +458,84 @@ export async function unthrottleUser(
       logger.log("ERROR", `no normal rate for ${username}`);
       return false;
     }
-    let anyAck = false;
+    let restored = 0;
     for (const j of join) {
-      if (await unthrottleOne(cfg, db, logger, username, j.acctuniqueid, j.framedipaddress, normal)) {
-        anyAck = true;
+      if (await unthrottleOne(cfg, db, logger, username, j.acctuniqueid, j.framedipaddress, normal, true)) {
+        restored++;
       }
     }
-    return anyAck;
+    return restored > 0;
   }
 
-  const normal = await resolveNormalRate(db, username);
-  if (!normal) {
-    logger.log("ERROR", `no normal rate for ${username}`);
-    return false;
+  // Offline user: nothing is throttled on the NAS (a new session starts at the
+  // RADIUS-provided normal rate), so just clear our bookkeeping.
+  const ips = await activeSessionIps(db, username);
+  if (ips.length > 0) {
+    const normal = await resolveNormalRate(db, username);
+    if (!normal) {
+      logger.log("ERROR", `no normal rate for ${username}`);
+      return false;
+    }
+    // A failed CoA must NOT clear the flag: the user would stay throttled on
+    // the router with nothing left to ever restore them.
+    if (!(await coaFanOut(cfg, db, logger, username, normal))) return false;
+    logger.log("RESTORE", `${username} -> ${normal}`);
   }
-  const ack = await coaFanOut(cfg, db, logger, username, normal);
   await resetQuota(db, username);
   await rebaseSessionBaselines(db, username);
-  if (ack) logger.log("RESTORE", `${username} -> ${normal}`);
-  return ack;
+  return true;
+}
+
+/**
+ * Reset quota state. With a username, optionally CoA-restore that user first
+ * (CoA must run BEFORE the bookkeeping is wiped: per-device restore needs the
+ * join rows the rebase deletes). Without a username (the daily rollover), every
+ * currently-throttled user is CoA-restored first — clearing the flag alone
+ * would leave them stuck at the throttled rate on the router with nothing left
+ * that would ever restore them.
+ * Returns the users whose CoA restore failed (still throttled on the NAS).
+ */
+export async function resetUsers(
+  cfg: AppConfig,
+  db: Db,
+  logger: Logger,
+  username: string | undefined,
+  coa: boolean,
+): Promise<string[]> {
+  const failed: string[] = [];
+  if (username !== undefined && !validUser(username)) {
+    throw new Error(`invalid username ${JSON.stringify(username)}`);
+  }
+  let targets: string[] = [];
+  if (username !== undefined) {
+    if (coa) targets = [username];
+  } else {
+    const r = await rows<{ username: string }>(
+      db,
+      db.query.execute(sql`
+        SELECT username FROM fup_state WHERE throttled = 1
+        UNION
+        SELECT username FROM fup_state_throttled
+      `),
+    );
+    targets = r.map((x) => x.username);
+  }
+  for (const u of targets) {
+    if (!validUser(u)) {
+      logger.log("SKIP", `invalid username ${u}`);
+      continue;
+    }
+    if (!(await unthrottleUser(cfg, db, logger, u))) {
+      failed.push(u);
+      logger.log("COA_FAILED", `${u} - restore failed; may still be throttled on the NAS`);
+    }
+  }
+  // Single-user restore that failed: keep the throttle state so the operator
+  // (or the next cycle) can retry instead of orphaning a throttled session.
+  if (username !== undefined && failed.length > 0) return failed;
+  await resetQuota(db, username);
+  await rebaseSessionBaselines(db, username);
+  return failed;
 }
 
 /** Reached-quota predicate, re-exported so entrypoints stay thin. */
@@ -465,7 +584,7 @@ interface PerDeviceRow {
 }
 
 /** A throttled-session row from `fup_state_throttled`. */
-interface ThrottledJoinRow {
+export interface ThrottledJoinRow {
   acctuniqueid: string;
   framedipaddress: string;
   throttledAt: Date;
@@ -507,15 +626,43 @@ async function loadPerDeviceRows(db: Db, username: string): Promise<PerDeviceRow
   return out;
 }
 
-/** Load currently throttled (user, session) join rows for one user. */
-async function loadThrottledJoin(db: Db, username: string): Promise<ThrottledJoinRow[]> {
-  return rows<{ acctuniqueid: string; framedipaddress: string; throttled_at: Date; throttled_rate: string }>(
+/**
+ * True when a throttled session's own FUP-Reset-Time grace has elapsed and it
+ * is therefore eligible for restore. An unparseable timestamp counts as
+ * elapsed so bad data can never pin a user throttled forever — if they are
+ * still over quota the next per-device check simply re-throttles them.
+ */
+export function resetGraceElapsed(
+  throttledAt: Date | string,
+  resetMinutes: number,
+  now: number = Date.now(),
+): boolean {
+  const ms = throttledAt instanceof Date ? throttledAt.getTime() : Date.parse(throttledAt);
+  if (!Number.isFinite(ms)) return true;
+  return now - ms >= resetMinutes * 60_000;
+}
+
+/** Load currently throttled (user, session) join rows for one user. Maps the
+ *  DB snake_case columns to the camelCase `ThrottledJoinRow` shape. */
+export async function loadThrottledJoin(db: Db, username: string): Promise<ThrottledJoinRow[]> {
+  const res = await rows<{
+    acctuniqueid: string;
+    framedipaddress: string;
+    throttled_at: Date | string;
+    throttled_rate: string;
+  }>(
     db,
     db.query.execute(sql`
       SELECT acctuniqueid, framedipaddress, throttled_at, throttled_rate
       FROM fup_state_throttled WHERE username = ${username}
     `),
   );
+  return res.map((r) => ({
+    acctuniqueid: r.acctuniqueid,
+    framedipaddress: r.framedipaddress,
+    throttledAt: r.throttled_at instanceof Date ? r.throttled_at : new Date(r.throttled_at),
+    throttledRate: r.throttled_rate,
+  }));
 }
 
 /** Self-heal: if fup_state says throttled=1 but the per-device table is
@@ -578,12 +725,13 @@ export async function unthrottleOne(
   acctuniqueid: string,
   ip: string,
   normalRate: string,
+  resetUsage = false,
 ): Promise<boolean> {
   if (!isValidIp(ip)) {
     logger.log("SKIP", `${username} invalid IP ${ip} (unthrottleOne)`);
     return false;
   }
-  const res = await sendCoa(cfg, username, ip, normalRate, "restore");
+  const res = await sendCoa(cfg, logger, username, ip, normalRate, "restore");
   const secrets = [cfg.nas.secret, cfg.db.password];
   logger.log(
     res.ok ? "COA_ACK" : "COA_FAILED",
@@ -594,6 +742,9 @@ export async function unthrottleOne(
     DELETE FROM fup_state_throttled
     WHERE username = ${username} AND acctuniqueid = ${acctuniqueid}
   `);
+  // Grace-period/reset restores start a fresh quota for the device; otherwise
+  // its unchanged over-quota usage would re-throttle it on the very next cycle.
+  if (resetUsage) await rebaseSession(db, acctuniqueid);
   await recomputeUserThrottleFlag(db, username);
   logger.log("RESTORE", `${username} ${ip} -> ${normalRate} (per_device)`);
   return true;
@@ -624,6 +775,16 @@ export async function runPerDeviceCheck(
   const liveByAcct = new Map(live.map((r) => [r.acctuniqueid, r]));
   const join = await loadThrottledJoin(db, username);
 
+  for (const r of live) {
+    logger.detail(2, "DEVICE_USAGE", `${username} ip=${r.framedipaddress || "<unset>"} acct=${r.acctuniqueid || "unknown"} daily=${r.dailyInput + r.dailyOutput} quota=${plan.quota}`);
+  }
+  for (const j of join) {
+    const at = j.throttledAt instanceof Date && Number.isFinite(j.throttledAt.getTime())
+      ? j.throttledAt.toISOString()
+      : "unknown";
+    logger.detail(2, "DEVICE_THROTTLED", `${username} ip=${j.framedipaddress || "<unset>"} acct=${j.acctuniqueid || "unknown"} since=${at} rate=${j.throttledRate || "<unset>"}`);
+  }
+
   // Step A: in-cycle unthrottle for join rows whose session is now under quota
   // (or whose session is gone — stale-cleared above).
   for (const j of join) {
@@ -650,13 +811,16 @@ export async function runPerDeviceCheck(
     if (!isQuotaReached(use, plan.quota)) continue;
 
     logger.log("FUP_REACHED", `${username} ${row.framedipaddress} (usage=${use} >= quota=${plan.quota})`);
-    // Prime normal_rate + throttled=0 (Bash pre-write compatibility).
+    // Save normal_rate and stamp today's fup_date (so day rollover does not
+    // mistake this throttle for a stale one). The throttled flag is left
+    // alone: it is recomputed from the join table, and forcing it to 0 here
+    // would hide sibling devices that are already throttled if this CoA fails.
     await db.query.execute(sql`
       UPDATE fup_state
-      SET normal_rate = ${plan.normalRate}, throttled = 0, last_updated = NOW()
+      SET normal_rate = ${plan.normalRate}, fup_date = CURRENT_DATE, last_updated = NOW()
       WHERE username = ${username}
     `);
-    const res = await sendCoa(cfg, username, row.framedipaddress, plan.fupRate, "throttle");
+    const res = await sendCoa(cfg, logger, username, row.framedipaddress, plan.fupRate, "throttle");
     const secrets = [cfg.nas.secret, cfg.db.password];
     logger.log(
       res.ok ? "COA_ACK" : "COA_FAILED",
@@ -695,49 +859,75 @@ export async function runCheckCycle(
   db: Db,
   logger: Logger,
 ): Promise<{ examined: number; throttled: number }> {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = await dbToday(db);
 
   // Pick up any user that has an open radacct session but no fup_session_state
   // row yet. Without this, a brand-new active user is invisible to the rest of
   // the cycle (aggregateUsage only returns rows from fup_session_state), so
-  // their first cycle is silently skipped.
+  // their first cycle is silently skipped. Baselines start at the current
+  // counters with zero daily usage, so pre-existing traffic is not billed.
   await db.query.execute(sql`
     INSERT IGNORE INTO fup_session_state
       (username, acctuniqueid, acctsessionid, framedipaddress,
        last_input, last_output, usage_date, daily_input, daily_output, last_seen, closed)
     SELECT
       ra.username, ra.acctuniqueid, ra.username, '0.0.0.0',
-      ra.acctinputoctets, ra.acctoutputoctets, CURRENT_DATE, 0, 0, NOW(), 0
+      COALESCE(ra.acctinputoctets, 0), COALESCE(ra.acctoutputoctets, 0),
+      CURRENT_DATE, 0, 0, NOW(), 0
     FROM radacct ra
     WHERE ra.acctstoptime IS NULL
       AND ra.username IS NOT NULL AND ra.username <> ''
       AND ra.framedipaddress IS NOT NULL AND ra.framedipaddress <> ''
+      AND ra.acctuniqueid IS NOT NULL AND ra.acctuniqueid <> ''
       AND NOT EXISTS (
         SELECT 1 FROM fup_session_state fss
         WHERE fss.acctuniqueid = ra.acctuniqueid
       )
   `);
 
-  // Refresh per-session counters so today's deltas are accurate (handles
-  // counter-reset cases via computeDelta inside updateSessionState).
-  const active = await fetchActiveSessions(db);
-  for (const s of active) {
-    await updateSessionState(db, s);
-  }
-
-  const daily = await aggregateUsage(db);
-
-  // Ensure a fup_state row exists and roll a stale day over (NEW_DAY reset).
+  // Ensure a fup_state row exists for every known user.
   await db.query.execute(sql`
     INSERT INTO fup_state (username, normal_rate, fup_date, throttled, last_updated)
     SELECT username, NULL, ${today}, 0, NOW() FROM fup_session_state
     GROUP BY username
     ON DUPLICATE KEY UPDATE username = username
   `);
+
+  // NEW_DAY rollover (in case the daily reset cron missed or has not run yet).
+  // A user still flagged from a previous day must be CoA-restored, not just
+  // un-flagged — clearing the flag alone strands them at the throttled rate.
+  const stale = await rows<{ username: string }>(
+    db,
+    db.query.execute(sql`
+      SELECT username FROM fup_state
+      WHERE throttled = 1 AND fup_date IS NOT NULL AND fup_date <> ${today}
+    `),
+  );
+  for (const { username } of stale) {
+    if (!validUser(username)) continue;
+    try {
+      logger.log("NEW_DAY", `${username} throttle from a previous day; restoring`);
+      await unthrottleUser(cfg, db, logger, username);
+    } catch (e) {
+      logger.log("ERROR", `new-day restore ${username}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   await db.query.execute(sql`
-    UPDATE fup_state SET throttled = 0, last_updated = NOW()
-    WHERE fup_date IS NOT NULL AND fup_date <> ${today}
+    UPDATE fup_state SET fup_date = ${today}, last_updated = NOW()
+    WHERE throttled = 0 AND (fup_date IS NULL OR fup_date <> ${today})
   `);
+
+  // Refresh per-session counters so today's deltas are accurate (handles
+  // counter-reset cases via computeDelta inside updateSessionState).
+  const active = await fetchActiveSessions(db);
+  for (const s of active) {
+    logger.detail(2, "SESSION", `user=${s.username || "<unset>"} acct=${s.acctuniqueid || "unknown"} in=${s.input} out=${s.output}`);
+    await updateSessionState(db, s, today);
+  }
+
+  // Only today's rows count: stale rows from earlier days (closed sessions, a
+  // missed daily reset) must not inflate today's total.
+  const daily = await aggregateUsage(db, undefined, today);
 
   let examined = 0;
   let throttled = 0;
@@ -748,44 +938,56 @@ export async function runCheckCycle(
       logger.log("SKIP", `invalid username ${username}`);
       continue;
     }
-    const plan = await resolveUserPlan(db, username);
-    if (plan.quota <= 0n) continue;
-    logger.log("DAILY_USAGE", `${username} = ${use.dailyInput +use.dailyOutput} bytes (quota=${plan.quota})`);
+    // One bad user (DB hiccup, odd row) must not abort everyone else's cycle.
+    try {
+      const plan = await resolveUserPlan(db, username);
+      if (plan.quota <= 0n) continue;
+      logger.log("DAILY_USAGE", `${username} = ${use.dailyInput + use.dailyOutput} bytes (quota=${plan.quota})`);
 
-    if (plan.perDevice) {
-      // Per-device mode: each session evaluated independently. The aggregate
-      // in `use` is informational; the actual decision is row-by-row inside.
-      logger.log("PER_DEVICE_ACTIVE", `${username} (quota=${plan.quota} per device)`);
-      const r = await runPerDeviceCheck(cfg, db, logger, username, plan);
-      throttled += r.throttled;
-      continue;
-    }
+      if (plan.perDevice) {
+        // Per-device mode: each session evaluated independently. The aggregate
+        // in `use` is informational; the actual decision is row-by-row inside.
+        logger.log("PER_DEVICE_ACTIVE", `${username} (quota=${plan.quota} per device)`);
+        const r = await runPerDeviceCheck(cfg, db, logger, username, plan);
+        throttled += r.throttled;
+        continue;
+      }
 
-    // Edge 2: user transitioned from per-device to per-user mode. Drop any
-    // join rows; the aggregate path below re-throttles the user as a whole
-    // if still over quota.
-    await db.query.execute(sql`
-      DELETE FROM fup_state_throttled WHERE username = ${username}
-    `);
+      // Edge 2: user transitioned from per-device to per-user mode. Drop any
+      // join rows; the aggregate path below re-throttles the user as a whole
+      // if still over quota.
+      await db.query.execute(sql`
+        DELETE FROM fup_state_throttled WHERE username = ${username}
+      `);
 
-    const state = await fetchThrottleState(db, username);
-    if (state.throttled) continue;
-    if (!isQuotaReached(use.dailyInput + use.dailyOutput, plan.quota)) continue;
+      const state = await fetchThrottleState(db, username);
+      if (state.throttled) continue;
+      if (!isQuotaReached(use.dailyInput + use.dailyOutput, plan.quota)) continue;
 
-    logger.log("FUP_REACHED", `${username} (usage=${use.dailyInput + use.dailyOutput} >= quota=${plan.quota})`);
-    // Save normal rate + prime throttled=0 before the CoA attempt (Bash pre-write).
-    await db.query.execute(sql`
-      UPDATE fup_state
-      SET normal_rate = ${plan.normalRate}, fup_date = ${today}, throttled = 0, last_updated = NOW()
-      WHERE username = ${username}
-    `);
-    const ack = await coaFanOut(cfg, db, logger, username, plan.fupRate);
-    if (ack) {
-      await setThrottled(db, username, true);
-      throttled++;
-      logger.log("THROTTLED", `${username} -> ${plan.fupRate}`);
-    } else {
-      logger.log("COA_FAILED", `${username} - will retry next cycle`);
+      // Offline user over quota: nothing to throttle now. Don't spam
+      // COA_FAILED every minute; they are re-evaluated when a session opens.
+      if ((await activeSessionIps(db, username)).length === 0) {
+        logger.detail(2, "SKIP", `${username} over quota but has no active session`);
+        continue;
+      }
+
+      logger.log("FUP_REACHED", `${username} (usage=${use.dailyInput + use.dailyOutput} >= quota=${plan.quota})`);
+      // Save normal rate + prime throttled=0 before the CoA attempt (Bash pre-write).
+      await db.query.execute(sql`
+        UPDATE fup_state
+        SET normal_rate = ${plan.normalRate}, fup_date = ${today}, throttled = 0, last_updated = NOW()
+        WHERE username = ${username}
+      `);
+      const ack = await coaFanOut(cfg, db, logger, username, plan.fupRate);
+      if (ack) {
+        await setThrottled(db, username, true);
+        throttled++;
+        logger.log("THROTTLED", `${username} -> ${plan.fupRate}`);
+      } else {
+        logger.log("COA_FAILED", `${username} - will retry next cycle`);
+      }
+    } catch (e) {
+      logger.log("ERROR", `check ${username}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -813,40 +1015,46 @@ export async function recoverResetTimeUsers(
       logger.log("SKIP", `invalid username ${username}`);
       continue;
     }
-    const plan = await resolveUserPlan(db, username);
-    if (plan.resetMinutes == null || plan.resetMinutes <= 0 || throttled_at == null) continue;
-    const graceMs = plan.resetMinutes * 60_000;
+    try {
+      const plan = await resolveUserPlan(db, username);
+      if (plan.resetMinutes == null || plan.resetMinutes <= 0) continue;
+      const resetMinutes = plan.resetMinutes;
 
-    if (plan.perDevice) {
-      // Per-device: FUP-Reset-Time applies to each device's own throttle
-      // timestamp. A device whose throttled_at + resetMinutes <= now is
-      // restored independently. The user-level throttled_at (MIN of all
-      // join rows) drives the iteration; per-row grace is checked against
-      // each row's own throttled_at.
-      const join = await loadThrottledJoin(db, username);
-      if (join.length === 0) {
-        // Stale flag without rows: clear and move on.
-        await selfHealThrottleFlag(db, username);
+      if (plan.perDevice) {
+        // Per-device: FUP-Reset-Time applies to each device's own throttle
+        // timestamp. A device whose throttled_at + resetMinutes <= now is
+        // restored independently (and gets a fresh quota).
+        const join = await loadThrottledJoin(db, username);
+        if (join.length === 0) {
+          // Stale flag without rows: clear and move on.
+          await selfHealThrottleFlag(db, username);
+          continue;
+        }
+        const normal = plan.normalRate || (await resolveNormalRate(db, username)) || "";
+        if (!normal) {
+          logger.log("ERROR", `no normal rate for ${username}`);
+          continue;
+        }
+        let userRecovered = false;
+        for (const j of join) {
+          if (!resetGraceElapsed(j.throttledAt, resetMinutes)) continue;
+          logger.log("RESET", `${username} ${j.framedipaddress} FUP-Reset-Time elapsed; restoring`);
+          if (await unthrottleOne(cfg, db, logger, username, j.acctuniqueid, j.framedipaddress, normal, true)) {
+            userRecovered = true;
+          }
+        }
+        if (userRecovered) recovered++;
         continue;
       }
-      const normal = plan.normalRate || (await resolveNormalRate(db, username)) || "";
-      if (!normal) continue;
-      let userRecovered = false;
-      for (const j of join) {
-        const rowMs = j.throttled_at instanceof Date ? j.throttled_at.getTime() : new Date(j.throttled_at).getTime();
-        if (Date.now() - rowMs < graceMs) continue;
-        logger.log("RESET", `${username} ${j.framedipaddress} FUP-Reset-Time elapsed; restoring`);
-        if (await unthrottleOne(cfg, db, logger, username, j.acctuniqueid, j.framedipaddress, normal)) {
-          userRecovered = true;
-        }
-      }
-      if (userRecovered) recovered++;
-      continue;
-    }
 
-    if (Date.now() - throttled_at.getTime() >= graceMs) {
-      logger.log("RESET", `${username} FUP-Reset-Time elapsed; restoring`);
-      if (await unthrottleUser(cfg, db, logger, username)) recovered++;
+      // A NULL throttled_at (flag set before the column existed) is treated as
+      // elapsed so such a user cannot be pinned throttled forever.
+      if (throttled_at == null || resetGraceElapsed(throttled_at, resetMinutes)) {
+        logger.log("RESET", `${username} FUP-Reset-Time elapsed; restoring`);
+        if (await unthrottleUser(cfg, db, logger, username)) recovered++;
+      }
+    } catch (e) {
+      logger.log("ERROR", `recover ${username}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   return recovered;
@@ -856,7 +1064,7 @@ export async function recoverResetTimeUsers(
  * Sum today's accumulated daily usage per user from `fup_session_state`.
  * This is what `fup-check.ts` compares against each user's quota.
  */
-export async function aggregateUsage(db: Db, username?: string): Promise<Map<string, UserUsage>> {
+export async function aggregateUsage(db: Db, username?: string, today?: string): Promise<Map<string, UserUsage>> {
   const res = await rows<{ username: string; daily_input: unknown; daily_output: unknown }>(
     db,
     db.query.execute(sql`
@@ -864,7 +1072,9 @@ export async function aggregateUsage(db: Db, username?: string): Promise<Map<str
              SUM(COALESCE(daily_input, 0)) AS daily_input,
              SUM(COALESCE(daily_output, 0)) AS daily_output
       FROM fup_session_state
-      ${username ? sql`WHERE username = ${username}` : sql``}
+      WHERE 1 = 1
+        ${username ? sql`AND username = ${username}` : sql``}
+        ${today ? sql`AND usage_date = ${today}` : sql``}
       GROUP BY username
     `),
   );

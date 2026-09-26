@@ -47,7 +47,8 @@ Examples:
 
 ### 1.2 `Mikrotik-Rate-Limit`
 
-The user's **normal** rate, restored on unthrottle. Standard MikroTik
+The user's **normal** rate, restored on unthrottle (read live from the
+attribute; `fup_state.normal_rate` is only a fallback, so plan changes apply). Standard MikroTik
 Vendor-Specific Attribute. Format is `rx/tx`, suffixes
 `k` / `K` / `m` / `M` / `g` / `G` are accepted.
 
@@ -76,10 +77,12 @@ plans: the user gets a few hours of slow access, then auto-recovers.
 
 - Set to `1440` → 24 hours
 - Set to `60` → 1 hour
+- On restore the user (or device, in per-device mode) also gets a **fresh
+  daily quota**, so it is not re-throttled on the next cycle.
 - Set to `null` / `0` / negative → auto-unthrottle is **disabled**
   (the user stays throttled until an operator runs `fup-reset <user>`)
 - **Soft-defect guard (post-2026-09 fix):** `resetMinutes <= 0` is
-  rejected by `recoverResetTimeUsers` (ops.ts:484). Previously a value
+  rejected by `recoverResetTimeUsers` (ops.ts:856). Previously a value
   of `0` would silently auto-unthrottle every throttled user on the
   next cycle.
 
@@ -141,9 +144,9 @@ IF NOT EXISTS`) and safe to re-run on a live system.
 
 ## 2. FreeRADIUS — register the custom attributes
 
-The three custom attributes (`Max-Daily-Traffic`, `FUP-Rate-Limit`,
-`FUP-Reset-Time`) are not in the FreeRADIUS base dictionary. You need
-to add them once. There are two methods.
+The four custom attributes (`Max-Daily-Traffic`, `FUP-Rate-Limit`,
+`FUP-Reset-Time`, `FUP-Per-Device`) are not in the FreeRADIUS base
+dictionary. You need to add them once. There are two methods.
 
 ### 2.1 Method A — extend an existing dictionary (recommended)
 
@@ -162,7 +165,7 @@ ATTRIBUTE   FUP-Reset-Time        3002    integer
 ATTRIBUTE   FUP-Per-Device        3003    integer
 ```
 
-Attribute codes `3000`–`3002` are picked from the unallocated
+Attribute codes `3000`–`3003` are picked from the unallocated
 FreeRADIUS user-defined range (`3000`+). Pick anything in that range
 that doesn't collide with your existing dictionary.
 
@@ -270,17 +273,18 @@ Locate it with:
 grep -rln "Mikrotik-Rate-Limit" /etc/daloradius /var/www/daloradius 2>/dev/null
 ```
 
-Add the three FUP names anywhere alongside `Mikrotik-Rate-Limit`.
+Add the four FUP names anywhere alongside `Mikrotik-Rate-Limit`.
 
 ### 3.2 Set on a user via daloRADIUS web UI
 
 1. Login as operator.
 2. **Users → List Users → <user> → Edit → Attributes**.
-3. The "Attribute" dropdown should now include the three FUP names.
+3. The "Attribute" dropdown should now include the four FUP names.
 4. For each attribute, set:
    - `Max-Daily-Traffic` → `Value` = bytes, e.g. `1073741824`
    - `FUP-Rate-Limit` → `Value` = rate, e.g. `256k/256k`
    - `FUP-Reset-Time` → `Value` = minutes, e.g. `1440`
+   - `FUP-Per-Device` → `Value` = `0` (default) or `1` (per-device)
 5. Click **Apply**.
 
 daloRADIUS writes to the same `radcheck` / `radreply` tables —
@@ -370,7 +374,103 @@ INSERT INTO radgroupreply (groupname, attribute, op, value) VALUES
 
 ---
 
-## 5. Troubleshooting
+## 5. Profile examples
+
+A **profile** is a named group (`radgroupcheck` / `radgroupreply`) plus the
+`radusergroup` rows that attach subscribers to it. Everything above in §2.4
+and §4 composes into profiles; these are three ready-made sets covering the
+usual deployment shapes. All of them are per-group, so one `INSERT` block
+provisions an entire plan tier.
+
+### 5.1 Residential aggregate — `plan-home-100g`
+
+Many PPPoE subscribers, one generous cap, combined-per-username throttling,
+short grace so a busy evening recovers by morning.
+
+```sql
+INSERT INTO radgroupcheck (groupname, attribute, op, value) VALUES
+  ('plan-home-100g', 'Max-Daily-Traffic', ':=', '107374182400');  -- 100 GiB
+
+INSERT INTO radgroupreply (groupname, attribute, op, value) VALUES
+  ('plan-home-100g', 'Mikrotik-Rate-Limit', ':=', '30M/30M'),
+  ('plan-home-100g', 'FUP-Rate-Limit',      ':=', '10M/10M'),
+  ('plan-home-100g', 'FUP-Reset-Time',      ':=', '720');          -- 12 h grace
+  -- FUP-Per-Device omitted => per-user aggregate (default)
+
+INSERT INTO radusergroup (username, groupname, priority) VALUES
+  ('bob',   'plan-home-100g', 1),
+  ('dave',  'plan-home-100g', 1),
+  ('erin',  'plan-home-100g', 1);
+```
+
+Behaviour: when the sum of `bob`'s sessions crosses 100 GiB, **all** of
+bob's live sessions drop to 10M/10M. Anything still throttled 12 hours
+later is auto-restored to 30M/30M; the daily reset clears it regardless.
+
+### 5.2 Household per-device — `plan-home-50g-device`
+
+For family plans where one heavy device shouldn't slow the rest. The cap is
+per device, not per username.
+
+```sql
+INSERT INTO radgroupcheck (groupname, attribute, op, value) VALUES
+  ('plan-home-50g-device', 'Max-Daily-Traffic', ':=', '53687091200');  -- 50 GiB/device
+
+INSERT INTO radgroupreply (groupname, attribute, op, value) VALUES
+  ('plan-home-50g-device', 'Mikrotik-Rate-Limit', ':=', '50M/50M'),
+  ('plan-home-50g-device', 'FUP-Rate-Limit',      ':=', '5M/5M'),
+  ('plan-home-50g-device', 'FUP-Reset-Time',      ':=', '1440'),       -- 24 h grace
+  ('plan-home-50g-device', 'FUP-Per-Device',      ':=', '1');
+
+INSERT INTO radusergroup (username, groupname, priority) VALUES
+  ('carol', 'plan-home-50g-device', 1);
+```
+
+Behaviour: only the `(carol, acctuniqueid)` row that crosses 50 GiB is
+throttled; the parent's laptop keeps 50M/50M. Requires `fup_state_throttled`
+(`migration.sql`) before enabling — see §1.5 and the pre-flight checklist in
+§4.4.
+
+### 5.3 Wholesale / PPPoE concentrator — `plan-wholesale`
+
+High-capacity links resold to downstream ISPs. The operator wants a hard cap
+with no automatic recovery during the day (only the 00:01 reset), so no
+`FUP-Reset-Time` row is set.
+
+```sql
+INSERT INTO radgroupcheck (groupname, attribute, op, value) VALUES
+  ('plan-wholesale', 'Max-Daily-Traffic', ':=', '5497558138880');  -- 5 TiB
+
+INSERT INTO radgroupreply (groupname, attribute, op, value) VALUES
+  ('plan-wholesale', 'Mikrotik-Rate-Limit', ':=', '1G/1G'),
+  ('plan-wholesale', 'FUP-Rate-Limit',      ':=', '100M/100M');
+  -- FUP-Reset-Time omitted => stays throttled until the daily reset
+  -- FUP-Per-Device omitted   => aggregate across the link's sessions
+
+INSERT INTO radusergroup (username, groupname, priority) VALUES
+  ('wholesale-isp-a', 'plan-wholesale', 1),
+  ('wholesale-isp-b', 'plan-wholesale', 1);
+```
+
+### 5.4 Choosing a shape
+
+| Requirement | Set |
+|---|---|
+| Throttle the whole subscriber together | omit `FUP-Per-Device` (default 0) |
+| Throttle only the offending device | `FUP-Per-Device = 1` |
+| Let a throttled user auto-recover mid-day | set `FUP-Reset-Time` (minutes) |
+| Keep them throttled until the daily reset | omit `FUP-Reset-Time` |
+| Different throttled speed per tier | set `FUP-Rate-Limit` per group |
+| No FUP at all | omit / zero `Max-Daily-Traffic` |
+
+Attributes are resolved per-user first (`radcheck` → `radreply`), then from
+the group (`radgroupcheck` → `radgroupreply`); a per-user row always overrides
+the group. That makes it cheap to give one subscriber an exception without
+splitting their tier.
+
+---
+
+## 6. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -383,3 +483,5 @@ INSERT INTO radgroupreply (groupname, attribute, op, value) VALUES
 | User with `FUP-Per-Device=1` still throttled as a whole | stale `fup_state.throttled` from a prior per-user cycle | run a `fup-check` cycle; `recomputeUserThrottleFlag` rebuilds the flag from the join table |
 | `fup-reset <user>` on a per-device plan only restores some devices | expected: `fup-reset` CoAs every join row for the user; check `radclient` for any IP that failed to ACK and look for `RADCLIENT_MISSING` | inspect logs for the IP that failed CoA; the row remains until ACK succeeds or until daily reset |
 | `fup_state_throttled` table missing | `migration.sql` not yet run on this DB | run `migration.sql` (additive, `IF NOT EXISTS`) and restart the cycle |
+| CoA returns `CoA-NAK` / no `Error-Cause` in the log | radclient output truncated in the cycle log | run `bun run debug <user> [ip]` — it always fires a real CoA and prints the parsed `Error-Cause` reason, e.g. `Unsupported-Extension (402)` |
+| No idea which IP/plan a user resolves to | plan or session rows unexpected | `bun run debug <user>` prints the resolved quota / `FUP-Rate-Limit` / `normal_rate` / `FUP-Per-Device` flag and every targeted IP before sending |

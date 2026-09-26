@@ -37,4 +37,63 @@ describe("logger", () => {
     expect(resolveLogPath("/var/log/fup.log")).toBe("/var/log/fup.log");
     expect(resolveLogPath("relative/path.log")).toBe("relative/path.log");
   });
+
+  test("level 0 writes to file but does not echo", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fup-log-"));
+    const logPath = join(dir, "fup.log");
+    const orig = console.error;
+    const echoed: string[] = [];
+    console.error = (line: string) => echoed.push(line);
+    try {
+      const log = createLogger(logPath, 0);
+      log.log("START", "quiet");
+      log.detail(2, "SESSION", "user=alice");
+      await new Promise((r) => setTimeout(r, 20));
+      expect(echoed).toEqual([]);
+      const file = await readFile(logPath, "utf8");
+      // detail() always reaches the file even when it is not echoed.
+      expect(file).toContain("SESSION: user=alice");
+    } finally {
+      console.error = orig;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("level 1 echoes log() but not detail(2)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fup-log-"));
+    const logPath = join(dir, "fup.log");
+    const orig = console.error;
+    const echoed: string[] = [];
+    console.error = (line: string) => echoed.push(line);
+    try {
+      const log = createLogger(logPath, 1);
+      log.log("START", "loud");
+      log.detail(2, "SESSION", "user=alice");
+      log.detail(1, "DETAIL", "level1");
+      expect(echoed).toHaveLength(2);
+      expect(echoed[0]).toContain("START: loud");
+      expect(echoed[1]).toContain("DETAIL: level1");
+    } finally {
+      console.error = orig;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("level 2 echoes detail(2), and a boolean true still means level 1", () => {
+    const dir = tmpdir();
+    const logPath = join(dir, `fup-boolean-${process.pid}-${Date.now()}.log`);
+    const orig = console.error;
+    const echoed: string[] = [];
+    console.error = (line: string) => echoed.push(line);
+    try {
+      createLogger(logPath, 2).detail(2, "SESSION", "user=alice");
+      createLogger(logPath, true).log("START", "legacy");
+      createLogger(logPath, true).detail(2, "SESSION", "user=bob");
+      expect(echoed).toHaveLength(2);
+      expect(echoed[0]).toContain("SESSION: user=alice");
+      expect(echoed[1]).toContain("START: legacy");
+    } finally {
+      console.error = orig;
+    }
+  });
 });

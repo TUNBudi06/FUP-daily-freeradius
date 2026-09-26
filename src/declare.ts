@@ -47,3 +47,15 @@ export function isMikrotikRate(s: string): boolean {
 export function validRate(rate: string): boolean {
   return isMikrotikRate(rate);
 }
+
+const SAFE_RATE_RE = /^[0-9A-Za-z\/. -]{1,128}$/;
+
+/**
+ * True when a rate string is safe to place inside the quoted CoA body. Broader
+ * than `isMikrotikRate` (MikroTik burst syntax like "10M/10M 20M/20M 8M/8M 8/8"
+ * is legal) but rejects quotes, backslashes and control chars/newlines, which
+ * would let a bad DB value inject extra attributes into radclient's stdin.
+ */
+export function isSafeRateString(s: string): boolean {
+  return SAFE_RATE_RE.test(s);
+}

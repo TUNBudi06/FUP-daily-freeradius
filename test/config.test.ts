@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isValidIp, loadConfig } from "../src/config.ts";
+import { isValidIp, loadConfig, parseDebugLevel } from "../src/config.ts";
 
 const base = {
   FUP_DB_HOST: "db.lan",
@@ -43,5 +43,30 @@ describe("config", () => {
     expect(isValidIp("10.0.0.1")).toBe(true);
     expect(isValidIp("256.1.1.1")).toBe(false);
     expect(isValidIp("10.0.0")).toBe(false);
+  });
+
+  test("debug level defaults to 0 and accepts 0/1/2", () => {
+    expect(loadConfig(base).debugLevel).toBe(0);
+    expect(loadConfig({ ...base, FUP_DEBUG: "0" }).debugLevel).toBe(0);
+    expect(loadConfig({ ...base, FUP_DEBUG: "1" }).debugLevel).toBe(1);
+    expect(loadConfig({ ...base, FUP_DEBUG: "2" }).debugLevel).toBe(2);
+  });
+
+  test("debug level tolerates surrounding whitespace", () => {
+    expect(parseDebugLevel(" 1 ")).toBe(1);
+    expect(parseDebugLevel("\t2\n")).toBe(2);
+  });
+
+  test("debug level clamps above 2 and falls back to 0 otherwise", () => {
+    expect(parseDebugLevel("3")).toBe(2);
+    expect(parseDebugLevel("99")).toBe(2);
+    expect(parseDebugLevel(undefined)).toBe(0);
+    expect(parseDebugLevel("")).toBe(0);
+    expect(parseDebugLevel("   ")).toBe(0);
+    expect(parseDebugLevel("abc")).toBe(0);
+    expect(parseDebugLevel("1.5")).toBe(0);
+    expect(parseDebugLevel("-1")).toBe(0);
+    expect(parseDebugLevel("NaN")).toBe(0);
+    expect(parseDebugLevel("1e2")).toBe(0);
   });
 });

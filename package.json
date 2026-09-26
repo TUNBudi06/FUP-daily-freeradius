@@ -5,6 +5,7 @@
   "scripts": {
     "check": "bun run src/bin/fup-check.ts",
     "reset": "bun run src/bin/fup-reset.ts",
+    "debug": "bun run src/bin/fup-debug.ts",
     "build": "bun run scripts/build.mjs",
     "test": "bun test"
   },

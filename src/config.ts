@@ -26,8 +26,13 @@ export interface AppConfig {
   radclientDict: string;
   /** radclient -D second dictionary directory. */
   radclientDictDir: string;
-  /** Echo every log line to console (stderr). Enabled by FUP_DEBUG=1. */
-  verbose: boolean;
+  /**
+   * Diagnostic verbosity from FUP_DEBUG, clamped to 0..2:
+   *   0 = file log only (default)
+   *   1 = also echo every log line to stderr (the old FUP_DEBUG=1 behaviour)
+   *   2 = 1 + per-session/per-IP detail and raw radclient output
+   */
+  debugLevel: number;
 }
 
 const reIpV4 = /^(\d{1,3}\.){3}\d{1,3}$/;
@@ -55,6 +60,21 @@ function needInt(env: Record<string, string | undefined>, key: string): number {
   return n;
 }
 
+/**
+ * Parse FUP_DEBUG into a debug level clamped to 0..2. Diagnostics must never
+ * take the cycle down, so every malformed value (missing, blank, whitespace,
+ * non-numeric, negative, fractional, NaN) quietly falls back to 0; anything
+ * above 2 is clamped to 2.
+ */
+export function parseDebugLevel(raw: string | undefined): number {
+  if (raw == null) return 0;
+  const s = raw.trim();
+  if (!/^-?\d+$/.test(s)) return 0;
+  const n = Number(s);
+  if (!Number.isInteger(n) || n < 0) return 0;
+  return n > 2 ? 2 : n;
+}
+
 /** Build a validated config from an env record. Throws on missing/invalid values. */
 export function loadConfig(env: Record<string, string | undefined>): AppConfig {
   const nasHost = need(env, "FUP_NAS_IP");
@@ -77,7 +97,7 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
     radclientPath: need(env, "FUP_RADCLIENT"),
     radclientDict: need(env, "FUP_RADCLIENT_DICT"),
     radclientDictDir: need(env, "FUP_RADCLIENT_DICT_DIR"),
-    verbose: (env.FUP_DEBUG ?? "0") === "1",
+    debugLevel: parseDebugLevel(env.FUP_DEBUG),
   };
 }
 

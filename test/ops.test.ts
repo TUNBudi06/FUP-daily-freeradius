@@ -1,6 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { asBig, computeDelta, isQuotaReached } from "../src/fup.ts";
-import { quotaReached, redact, validUser } from "../src/ops.ts";
+import {
+  loadThrottledJoin,
+  quotaReached,
+  redact,
+  resetGraceElapsed,
+  validUser,
+} from "../src/ops.ts";
+import type { Db } from "../src/db.ts";
+
+/** Minimal fake Db: `execute` resolves to the mysql2 `[rows, fields]` tuple,
+ *  which is exactly the shape `unwrapRows` in ops.ts unwraps. */
+function fakeDb(rows: unknown[]): Db {
+  return {
+    query: { execute: () => Promise.resolve([rows, []]) },
+    close: () => Promise.resolve(),
+  } as unknown as Db;
+}
 
 describe("fup pure math (consumed by ops.ts)", () => {
   test("computeDelta: monotonic counter takes the difference", () => {
@@ -45,6 +61,58 @@ describe("quota decision", () => {
   });
 });
 
+describe("unthrottle / FUP-Reset-Time grace", () => {
+  test("loadThrottledJoin maps DB snake_case rows to camelCase fields", async () => {
+    const at = new Date("2026-09-01T10:00:00Z");
+    const db = fakeDb([
+      {
+        acctuniqueid: "sess-1",
+        framedipaddress: "10.6.7.20",
+        throttled_at: at,
+        throttled_rate: "512k/512k",
+      },
+    ]);
+    const join = await loadThrottledJoin(db, "alice");
+    expect(join).toHaveLength(1);
+    expect(join[0].acctuniqueid).toBe("sess-1");
+    expect(join[0].framedipaddress).toBe("10.6.7.20");
+    // The regression: the consumer needs a real Date, not `undefined`.
+    expect(join[0].throttledAt).toBeInstanceOf(Date);
+    expect(join[0].throttledAt.getTime()).toBe(at.getTime());
+    expect(join[0].throttledRate).toBe("512k/512k");
+  });
+
+  test("loadThrottledJoin coerces string timestamps to Date", async () => {
+    const db = fakeDb([
+      {
+        acctuniqueid: "sess-2",
+        framedipaddress: "10.6.7.21",
+        throttled_at: "2026-09-01T10:00:00Z",
+        throttled_rate: "1M/1M",
+      },
+    ]);
+    const join = await loadThrottledJoin(db, "bob");
+    expect(join[0].throttledAt).toBeInstanceOf(Date);
+    expect(join[0].throttledAt.getTime()).toBe(Date.parse("2026-09-01T10:00:00Z"));
+  });
+
+  test("a device inside its grace window is NOT restored", () => {
+    const now = Date.parse("2026-09-01T12:00:00Z");
+    const throttled = new Date(now - 29 * 60_000); // 29 min ago
+    expect(resetGraceElapsed(throttled, 30, now)).toBe(false);
+  });
+
+  test("a device whose grace has elapsed IS restored", () => {
+    const now = Date.parse("2026-09-01T12:00:00Z");
+    expect(resetGraceElapsed(new Date(now - 30 * 60_000), 30, now)).toBe(true);
+    expect(resetGraceElapsed(new Date(now - 90 * 60_000), 30, now)).toBe(true);
+  });
+
+  test("an unparseable timestamp does not pin a user throttled forever", () => {
+    expect(resetGraceElapsed(new Date("nonsense"), 30, Date.now())).toBe(true);
+  });
+});
+
 describe("hardening: input validation + redaction", () => {
   test("validUser accepts word chars, @, ., - and rejects control chars", () => {
     expect(validUser("alice")).toBe(true);
@@ -65,5 +133,34 @@ describe("hardening: input validation + redaction", () => {
     expect(redact("a:b", [])).toBe("a:b");
     expect(redact("x", ["x", "x"])).toBe("***");
     expect(redact("", ["anything"])).toBe("");
+  });
+});
+describe("day boundary + rate safety", () => {
+  test("normalizeDay treats Date and string days identically", async () => {
+    const { normalizeDay } = await import("../src/ops.ts");
+    expect(normalizeDay("2026-09-26")).toBe("2026-09-26");
+    expect(normalizeDay("2026-09-26 00:00:00")).toBe("2026-09-26");
+    expect(normalizeDay(new Date(2026, 8, 26))).toBe("2026-09-26"); // local getters
+    expect(normalizeDay(new Date("nope"))).toBeNull();
+    expect(normalizeDay(null)).toBeNull();
+  });
+
+  test("isSafeRateString allows burst syntax, rejects injection", async () => {
+    const { isSafeRateString } = await import("../src/declare.ts");
+    expect(isSafeRateString("5M/5M")).toBe(true);
+    expect(isSafeRateString("10M/10M 20M/20M 8M/8M 8/8")).toBe(true);
+    expect(isSafeRateString('5M/5M"\nUser-Name = "x')).toBe(false);
+    expect(isSafeRateString("")).toBe(false);
+  });
+
+  test("sendCoa refuses unsafe input without spawning radclient", async () => {
+    const { sendCoa } = await import("../src/coa.ts");
+    const { defaultAppConfig } = await import("../src/config.ts");
+    const logger = { log() {}, detail() {} };
+    const cfg = { ...defaultAppConfig(), radclientPath: "/nonexistent/radclient" };
+    const r = await sendCoa(cfg, logger, "alice", "10.0.0.1", '5M/5M"\nX = "1', "throttle");
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain("refused");
+    expect((await sendCoa(cfg, logger, 'a"b', "10.0.0.1", "5M/5M", "throttle")).detail).toContain("refused");
   });
 });

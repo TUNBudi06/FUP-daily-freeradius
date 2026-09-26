@@ -13,6 +13,10 @@ Two ways to run, pick one:
 Same behaviour, same `.env`, same log format. This doc covers binary first
 (recommended), then notes the source path.
 
+There is also a third, **non-cron** entrypoint: `fup-debug`, a manual CoA
+console. It is not built into `dist/` (only `check` and `reset` are), so it
+runs from source with `bun run debug <user> [ip]`. See §7.
+
 ---
 
 ## 1. Prerequisites
@@ -21,7 +25,9 @@ Same behaviour, same `.env`, same log format. This doc covers binary first
   The deployed binary itself needs no Bun at runtime.
 - **MySQL/MariaDB** with the FreeRADIUS `raddb` schema
   (`radcheck`, `radreply`, `radusergroup`, `radgroupcheck`, `radgroupreply`,
-  `radacct`, plus the two FUP tables `fup_state` and `fup_session_state`).
+  `radacct`, plus the FUP tables `fup_state` and `fup_session_state`). The
+  per-device join table `fup_state_throttled` is created by `migration.sql`
+  (see §4).
 - **radclient** (from the `freeradius-utils` package) on the machine that will
   fire CoAs:
 
@@ -100,7 +106,7 @@ chmod 600 .env     # contains the DB password and NAS secret
 | `FUP_RADCLIENT_DICT_DIR` | second dictionary dir (`-D`) | `/etc/freeradius/3.0` |
 | `FUP_LOG_FILE` | log file (must be writable) | `/var/log/fup.log` |
 | `FUP_LOCK_FILE` | lock file (must be writable) | `/tmp/fup.lock` |
-| `FUP_DEBUG` | `1` echoes every log line to stderr (diagnosis) | `0` |
+| `FUP_DEBUG` | debug level `0`–`2`: `1` echoes every log line to stderr, `2` adds per-session/per-IP detail. Malformed/out-of-range → `0` | `0` |
 
 Secrets are read from the environment only, never hardcoded or logged
 (redacted with `***` in log output).
@@ -109,30 +115,45 @@ Secrets are read from the environment only, never hardcoded or logged
 
 ## 4. Database migration
 
-The only schema change over the Bash version is one new column. Run it before
-the first cycle:
+Run `migration.sql` once before the first cycle:
 
 ```bash
 mysql raddb < migration.sql
 ```
 
-Which runs:
+It makes three changes — the `throttled_at` column, the `normal_rate`
+nullability fix, and the per-device join table:
 
 ```sql
 ALTER TABLE fup_state
-  ADD COLUMN throttled_at TIMESTAMP NULL DEFAULT NULL AFTER throttled;
+  ADD COLUMN throttled_at TIMESTAMP NULL DEFAULT NULL;
 ALTER TABLE fup_state MODIFY normal_rate VARCHAR(64) NULL DEFAULT NULL;
+
+CREATE TABLE IF NOT EXISTS fup_state_throttled (
+  username        VARCHAR(64) NOT NULL,
+  acctuniqueid    VARCHAR(64) NOT NULL,
+  framedipaddress VARCHAR(45) NOT NULL,
+  throttled_at    TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  throttled_rate  VARCHAR(64) NOT NULL,
+  PRIMARY KEY (username, acctuniqueid),
+  KEY idx_user (username)
+) ENGINE=InnoDB;
 ```
 
 - `throttled_at` drives FUP-Reset-Time auto-restore (timestamps the moment a
   user is throttled).
 - The `MODIFY` allows NULL so the bootstrap seed can write an unresolved
   `normal_rate`; safe to re-run on an already-migrated DB.
+- `fup_state_throttled` holds one row per throttled `(username, acctuniqueid)`
+  pair. It is only populated in **per-device** mode (`FUP-Per-Device=1`), but
+  the table must exist before you enable that mode — see §5. `CREATE TABLE IF
+  NOT EXISTS` makes the whole file safe to re-run on a live system.
 
-Verify the two FUP tables exist and have data after the first check cycle:
+Verify the three FUP tables exist and have data after the first check cycle:
 ```sql
 SELECT COUNT(*) FROM fup_state;
 SELECT COUNT(*) FROM fup_session_state;
+SELECT COUNT(*) FROM fup_state_throttled;   -- 0 unless per-device is in use
 ```
 
 ---
@@ -150,6 +171,22 @@ radcheck → radreply → radgroupcheck → radgroupreply):
 | `Mikrotik-Rate-Limit` | the user's **normal** rate, restored on reset, e.g. `100M/100M` |
 | `FUP-Rate-Limit` | the **throttled** rate sent when quota is exceeded, e.g. `5M/5M` |
 | `FUP-Reset-Time` | optional minutes of grace before auto-restore after a throttle (0/unset = never; only the daily reset clears it) |
+| `FUP-Per-Device` | `1` to evaluate each session against the cap independently and throttle only the offending device; `0`/unset = throttle every device for the username together |
+
+`FUP-Per-Device=1` requires the `fup_state_throttled` table from §4 — apply the
+migration **before** setting the attribute on any user or group. In per-device
+mode `Max-Daily-Traffic` is a per-device cap, not a per-username cap, and
+`FUP-Reset-Time` is measured from when each individual device was throttled;
+`fup-reset <user>` still clears every throttled device for the user. Full
+reference, mode-transition rules, and profile examples (residential, household,
+wholesale) are in [ATTRIBUTES.md](ATTRIBUTES.md) §1.5 and §5.
+
+The custom attribute names must also be registered in the FreeRADIUS and
+daloRADIUS dictionaries — see [ATTRIBUTES.md §2 and §3](ATTRIBUTES.md) — or
+`radclient` and the daloRADIUS UI will not recognise them.
+
+For ready-to-paste per-group **profiles** (`radgroupcheck` / `radgroupreply` +
+`radusergroup`), see [ATTRIBUTES.md §5](ATTRIBUTES.md).
 
 ---
 
@@ -164,7 +201,7 @@ the minute cron are forgiving (lock + short cycle), so a 00:01 daily is safe.
 ```cron
 # every minute: enforce FUP + auto-restore FUP-Reset-Time users
 * * * * * /root/script-FUP/dist/fup-check
-# once a day at 00:01: full quota rollover (no CoA)
+# once a day at 00:01: full quota rollover (CoA-restores anyone still throttled)
 1 0 * * * /root/script-FUP/dist/fup-reset
 ```
 
@@ -192,7 +229,7 @@ Manual operations:
 ```bash
 cd /root/script-FUP
 ./dist/fup-check                      # one check cycle, now
-./dist/fup-reset                      # reset everyone, no CoA
+./dist/fup-reset                      # reset everyone (still-throttled users are CoA-restored first)
 ./dist/fup-reset some-user --coa      # reset one user and CoA-restore their normal rate
 ```
 
@@ -236,6 +273,30 @@ SUMMARY RESET ALL
 DAILY_USAGE alice = 0 bytes (quota=52428800)   # post-reset
 ```
 
+### Debug console (single user, real CoA)
+
+When the cycle log isn't enough, `fup-debug` runs one user's CoA path in the
+foreground. It always sends a **real** CoA (unlike the cron, which only fires
+on a throttle decision) and always runs at debug level 2:
+
+```bash
+cd /root/script-FUP
+bun run debug alice            # every active IP for alice
+bun run debug alice 10.6.7.20  # only this IP
+```
+
+It is not compiled into `dist/` — run it from source (`bun` + `node_modules`
+required), i.e. only in source-mode installs. It prints a header with the
+resolved plan (quota, `FUP-Rate-Limit`, `normal_rate`, `FUP-Per-Device`) and
+the targeted IPs, then one result line per IP ending in `✓ ACK` or `✗ FAILED`.
+A NAK is suffixed with the parsed `Error-Cause`, e.g.
+`[NAK reason: Unsupported-Extension (402)]`.
+
+Exit codes: `0` all ACKs, `1` at least one failure, `2` bad/missing username,
+`3` no active session IPs. To exercise the path without touching the live
+router, temporarily point `FUP_NAS_IP` at an unreachable address — the CoA is
+logged but nothing changes on the NAS.
+
 ---
 
 ## 8. Troubleshooting
@@ -277,6 +338,27 @@ SELECT username, framedipaddress, acctstoptime FROM radacct
 `COA_FAILED` does **not** lose state — the user is simply left unthrottled and
 retried every cycle. Only an `ACK` sets `throttled = 1`.
 
+To see the exact radclient argv, CoA body, and parsed NAK reason for one user in
+the foreground, run the debug console (§7): `bun run debug <user> [ip]`.
+
+### Per-device user isn't throttled (or throttles everyone)
+
+Check the mode actually resolved for the user:
+
+```bash
+bun run debug testuser    # header shows perDevice=true/false and the plan
+```
+
+- `perDevice=false` with `FUP-Per-Device=1` set on the group → the user-level
+  attribute resolution is winning; confirm no `radcheck`/`radreply` row shadows
+  the group, and that the group is joined in `radusergroup`.
+- `perDevice=true` but the whole user throttled → a stale aggregate flag from a
+  prior per-user cycle; the next per-device cycle rebuilds it
+  (`recomputeUserThrottleFlag`).
+- Table missing error → `migration.sql` was not applied (§4).
+
+---
+
 ### `ERROR: Missing required env var ...`
 
 The cron user isn't seeing `.env` — either `cd` into the project dir in the
@@ -284,6 +366,8 @@ cron line (see above) or export the vars. Debug with:
 
 ```bash
 FUP_DEBUG=1 ./dist/fup-check
+# source mode, single user with full CoA detail:
+FUP_DEBUG=2 bun run debug testuser
 ```
 
 ### Drizzle says `Table 'raddb.fup_state' doesn't exist`

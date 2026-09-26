@@ -3,7 +3,7 @@
  * every attribute resolution, session delta, throttle decision, CoA fan-out,
  * and FUP-Reset-Time recovery lives in `ops.ts` exactly once.
  */
-import { loadConfig } from "../config.ts";
+import { loadConfig, parseDebugLevel } from "../config.ts";
 import { createLogger, type Logger } from "../logger.ts";
 import { Lock } from "../lock.ts";
 import { createDb } from "../db.ts";
@@ -11,7 +11,7 @@ import { runCheckCycle, recoverResetTimeUsers } from "../ops.ts";
 
 async function main(): Promise<void> {
   const cfg = loadConfig(process.env);
-  const logger: Logger = createLogger(cfg.logFile, cfg.verbose);
+  const logger: Logger = createLogger(cfg.logFile, cfg.debugLevel);
   const lock = new Lock(cfg.lockFile);
 
   // Concurrency: the lock is held for the whole cycle. A `false` acquire means
@@ -45,7 +45,7 @@ main().catch((err) => {
   // wraps mysql2 errors: the query is in `message`, the real cause (e.g.
   // "Table 'x.fup_state' doesn't exist") is on `cause` — surface both so the
   // actual failure is never hidden.
-  const logger: Logger = createLogger(process.env.FUP_LOG_FILE ?? "/tmp/fup.log", (process.env.FUP_DEBUG ?? "0") === "1");
+  const logger: Logger = createLogger(process.env.FUP_LOG_FILE ?? "/tmp/fup.log", parseDebugLevel(process.env.FUP_DEBUG));
   const detail =
     err instanceof Error && (err as { cause?: unknown }).cause instanceof Error
       ? `${(err as { cause: Error }).cause.message}`

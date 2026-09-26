@@ -3,11 +3,11 @@
  * for one user via `--coa`. All logic lives in `ops.ts`; this entrypoint only
  * parses argv, acquires the lock, and calls the shared helpers.
  */
-import { loadConfig } from "../config.ts";
+import { loadConfig, parseDebugLevel } from "../config.ts";
 import { createLogger, type Logger } from "../logger.ts";
 import { Lock } from "../lock.ts";
 import { createDb } from "../db.ts";
-import { resetQuota, rebaseSessionBaselines, unthrottleUser } from "../ops.ts";
+import { resetUsers, validUser } from "../ops.ts";
 
 interface Args {
   username?: string;
@@ -26,7 +26,12 @@ function parseArgs(argv: string[]): Args {
 async function main(): Promise<void> {
   const { username, coa } = parseArgs(process.argv.slice(2));
   const cfg = loadConfig(process.env);
-  const logger: Logger = createLogger(cfg.logFile, cfg.verbose);
+  const logger: Logger = createLogger(cfg.logFile, cfg.debugLevel);
+  if (username !== undefined && !validUser(username)) {
+    logger.log("ERROR", "fup-reset: invalid username argument");
+    console.error("fup-reset: invalid username (1..64 chars of word chars, @, ., -)");
+    process.exit(2);
+  }
   const lock = new Lock(cfg.lockFile);
 
   // Concurrency: the lock covers the whole reset. A `false` acquire means another
@@ -42,14 +47,11 @@ async function main(): Promise<void> {
   logger.log("START", `fup-reset ${scope}${coa ? " --coa" : ""}`);
 
   try {
-    await resetQuota(db, username);
-    await rebaseSessionBaselines(db, username);
-
-    if (coa && username) {
-      const restored = await unthrottleUser(cfg, db, logger, username);
-      logger.log(restored ? "COA_RESTORE" : "COA_FAILED", `${username}`);
-    }
-    logger.log("SUMMARY", `RESET ${scope}`);
+    // CoA-restore (when requested, or for every throttled user on a global
+    // reset) happens inside resetUsers BEFORE the bookkeeping is cleared.
+    const failed = await resetUsers(cfg, db, logger, username, coa);
+    if (username && coa) logger.log(failed.length === 0 ? "COA_RESTORE" : "COA_FAILED", `${username}`);
+    logger.log("SUMMARY", `RESET ${scope}${failed.length ? ` restore_failed=${failed.length}` : ""}`);
   } finally {
     await db.close();
     await lock.release();
@@ -58,7 +60,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  const logger: Logger = createLogger(process.env.FUP_LOG_FILE ?? "/tmp/fup.log", (process.env.FUP_DEBUG ?? "0") === "1");
+  const logger: Logger = createLogger(process.env.FUP_LOG_FILE ?? "/tmp/fup.log", parseDebugLevel(process.env.FUP_DEBUG));
   const detail =
     err instanceof Error && (err as { cause?: unknown }).cause instanceof Error
       ? `${(err as { cause: Error }).cause.message}`

@@ -1,11 +1,15 @@
-import { mkdir, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdir, rm, readFile, writeFile, stat } from "node:fs/promises";
+
+/** A lock dir with no readable pid this old was left by a crashed acquire. */
+const PIDLESS_STALE_MS = 60_000;
 
 /** Return true only if `pid` is an existing process. */
 function isAlive(pid: number): boolean {
   try {
     return process.kill(pid, 0);
-  } catch {
-    return false;
+  } catch (e) {
+    // EPERM: the process exists but belongs to another user — it is alive.
+    return (e as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
@@ -38,7 +42,18 @@ export class Lock {
           return this.acquire(); // retry once
         }
       } catch {
-        // pid file unreadable or missing — do NOT steal the lock.
+        // pid file unreadable or missing: normally another process is between
+        // mkdir and writing its pid, so do not steal — unless the directory is
+        // old enough that the owner must have crashed in that window.
+        try {
+          const age = Date.now() - (await stat(this.#dir)).mtimeMs;
+          if (age > PIDLESS_STALE_MS) {
+            await rm(this.#dir, { recursive: true, force: true });
+            return this.acquire();
+          }
+        } catch {
+          // lock vanished or unreadable — treat as held.
+        }
       }
       return false;
     }

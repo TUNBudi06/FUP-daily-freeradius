@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildCoaArgv } from "../src/coa.ts";
+import { buildCoaArgv, parseErrorCause } from "../src/coa.ts";
 import { defaultAppConfig } from "../src/config.ts";
 
 describe("buildCoaArgv", () => {
@@ -24,5 +24,25 @@ describe("buildCoaArgv", () => {
     // tokens that would signal shell-adjacent injection are absent
     expect(argv.some((a) => a.includes("|") || a.includes(";"))) .toBe(false);
     expect(argv.some((a) => a.includes("rm") || a.includes("&&"))).toBe(false);
+  });
+});
+
+describe("parseErrorCause", () => {
+  test("human reason + numeric code from a CoA-NAK attribute dump", () => {
+    const detail = [
+      "Received CoA-NAK",
+      "      Error-Cause = 402",
+      "      ... (Unsupported-Extension)",
+    ].join("\n");
+    expect(parseErrorCause(detail)).toBe("Unsupported-Extension (402)");
+  });
+
+  test("numeric code only when no parenthesized human string", () => {
+    expect(parseErrorCause("Received CoA-NAK\nError-Cause = 501")).toBe("501");
+  });
+
+  test("undefined when Error-Cause is absent", () => {
+    expect(parseErrorCause("Received CoA-ACK")).toBeUndefined();
+    expect(parseErrorCause("")).toBeUndefined();
   });
 });
