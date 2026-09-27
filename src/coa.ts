@@ -11,6 +11,9 @@ export interface CoaResult {
   detail: string;
   /** Present only when radclient reported a CoA-NAK. */
   nakReason?: string;
+  /** True when this result came from our own timeout, not a radclient reply —
+   *  distinct from a NAK/refusal: it usually means the NAS is unreachable. */
+  timedOut?: boolean;
 }
 
 /** radclient exit is indistinguishable from a network hang; cap the wait. */
@@ -121,8 +124,10 @@ export async function sendCoa(
 
   const done = full().finally(() => proc.killed); // release handle when finished
   let timerId: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   const timer = new Promise<never>((_, reject) => {
     timerId = setTimeout(() => {
+      timedOut = true;
       proc.kill();
       reject(new Error(`radclient timed out after ${COA_TIMEOUT_MS}ms`));
     }, COA_TIMEOUT_MS);
@@ -135,6 +140,7 @@ export async function sendCoa(
       ok,
       detail: reason ? `${detail} [NAK reason: ${reason}]` : detail,
       nakReason: reason,
+      timedOut,
     };
   };
 

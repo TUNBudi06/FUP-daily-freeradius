@@ -12,7 +12,7 @@ import type { Db } from "./db.ts";
 import { sql } from "drizzle-orm";
 import { ATTR, DEFAULT_FUP_RATE, isSafeRateString } from "./declare.ts";
 import { asBig, computeDelta, isQuotaReached, validUser } from "./fup.ts";
-import { sendCoa } from "./coa.ts";
+import { sendCoa, type CoaResult } from "./coa.ts";
 
 /** Truthy values accepted for the FUP-Per-Device attribute. Case-insensitive
  *  and trim-tolerant. Anything else (including "0", "false", blank, unset)
@@ -392,6 +392,16 @@ export async function resetQuota(db: Db, username?: string): Promise<void> {
 }
 
 /**
+ * Log event name for a CoA outcome: ACK on success, TIMEOUT when our own
+ * deadline fired (usually an unreachable NAS — an infra signal, not a config
+ * one), FAILED for anything else (NAK, spawn failure, refused input).
+ */
+export function coaEventName(res: CoaResult): string {
+  if (res.ok) return "COA_ACK";
+  return res.timedOut ? "COA_TIMEOUT" : "COA_FAILED";
+}
+
+/**
  * Send the enforced rate to every active IP of a user. Any ACK counts as
  * success; a partial failure still leaves the flag set (retried next cycle).
  */
@@ -414,7 +424,7 @@ export async function coaFanOut(
     }
     const res = await sendCoa(cfg, logger, username, ip, rate, "throttle");
     logger.log(
-      res.ok ? "COA_ACK" : "COA_FAILED",
+      coaEventName(res),
       redact(`${username} IP=${ip} -> ${rate} (${res.detail})`, secrets),
     );
     if (res.ok) ack = true;
@@ -450,7 +460,7 @@ export async function unthrottleUser(
       // Nothing to restore per-device, but the user-level flag may still
       // be set from a previous run. Self-heal so subsequent cycles start
       // clean.
-      await selfHealThrottleFlag(db, username);
+      await selfHealThrottleFlag(db, logger, username);
       return true;
     }
     const normal = plan.normalRate || (await resolveNormalRate(db, username)) || "";
@@ -519,6 +529,9 @@ export async function resetUsers(
       `),
     );
     targets = r.map((x) => x.username);
+    if (targets.length > 0) {
+      logger.log("RESET_TARGETS", `${targets.length} throttled user(s) to restore before the daily rollover`);
+    }
   }
   for (const u of targets) {
     if (!validUser(u)) {
@@ -666,8 +679,10 @@ export async function loadThrottledJoin(db: Db, username: string): Promise<Throt
 }
 
 /** Self-heal: if fup_state says throttled=1 but the per-device table is
- *  empty (or has no live sessions left), clear the user-level flag. */
-async function selfHealThrottleFlag(db: Db, username: string): Promise<boolean> {
+ *  empty (or has no live sessions left), clear the user-level flag. Runs
+ *  every per-device cycle, so it only logs when it actually changes a row —
+ *  otherwise every clean cycle for every per-device user would spam SELF_HEAL. */
+async function selfHealThrottleFlag(db: Db, logger: Logger, username: string): Promise<boolean> {
   const r = await first<{ hasRows: unknown }>(
     db,
     db.query.execute(sql`
@@ -676,11 +691,15 @@ async function selfHealThrottleFlag(db: Db, username: string): Promise<boolean> 
     `),
   );
   if (asBig(r?.hasRows) === 0n) {
-    await db.query.execute(sql`
+    const res = await db.query.execute(sql`
       UPDATE fup_state
       SET throttled = 0, throttled_at = NULL, last_updated = NOW()
-      WHERE username = ${username}
+      WHERE username = ${username} AND throttled = 1
     `);
+    const affected = Number((res as { affectedRows?: number })?.affectedRows ?? 0);
+    if (affected > 0) {
+      logger.log("SELF_HEAL", `${username} throttled flag cleared (no matching fup_state_throttled rows)`);
+    }
     return true;
   }
   return false;
@@ -734,7 +753,7 @@ export async function unthrottleOne(
   const res = await sendCoa(cfg, logger, username, ip, normalRate, "restore");
   const secrets = [cfg.nas.secret, cfg.db.password];
   logger.log(
-    res.ok ? "COA_ACK" : "COA_FAILED",
+    coaEventName(res),
     redact(`${username} acct=${acctuniqueid} IP=${ip} -> ${normalRate} (${res.detail})`, secrets),
   );
   if (!res.ok) return false;
@@ -767,7 +786,7 @@ export async function runPerDeviceCheck(
   let restored = 0;
 
   // Edge 10: fup_state says throttled but no join rows. Clear and log.
-  await selfHealThrottleFlag(db, username);
+  await selfHealThrottleFlag(db, logger, username);
   // Edge 3: drop join rows whose radacct session is no longer open.
   await clearStaleJoinRows(db, username, logger);
 
@@ -823,7 +842,7 @@ export async function runPerDeviceCheck(
     const res = await sendCoa(cfg, logger, username, row.framedipaddress, plan.fupRate, "throttle");
     const secrets = [cfg.nas.secret, cfg.db.password];
     logger.log(
-      res.ok ? "COA_ACK" : "COA_FAILED",
+      coaEventName(res),
       redact(`${username} IP=${row.framedipaddress} -> ${plan.fupRate} (${res.detail})`, secrets),
     );
     if (!res.ok) {
@@ -920,6 +939,11 @@ export async function runCheckCycle(
   // Refresh per-session counters so today's deltas are accurate (handles
   // counter-reset cases via computeDelta inside updateSessionState).
   const active = await fetchActiveSessions(db);
+  // Visible at the default log level (unlike the per-session SESSION detail
+  // lines below) so a healthy cron run is confirmable from the log alone —
+  // e.g. a sudden drop to 0 active sessions usually means radacct/NAS trouble,
+  // not that everyone disconnected.
+  logger.log("ACTIVE_SESSIONS", String(active.length));
   for (const s of active) {
     logger.detail(2, "SESSION", `user=${s.username || "<unset>"} acct=${s.acctuniqueid || "unknown"} in=${s.input} out=${s.output}`);
     await updateSessionState(db, s, today);
@@ -1027,7 +1051,7 @@ export async function recoverResetTimeUsers(
         const join = await loadThrottledJoin(db, username);
         if (join.length === 0) {
           // Stale flag without rows: clear and move on.
-          await selfHealThrottleFlag(db, username);
+          await selfHealThrottleFlag(db, logger, username);
           continue;
         }
         const normal = plan.normalRate || (await resolveNormalRate(db, username)) || "";

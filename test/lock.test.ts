@@ -47,3 +47,38 @@ describe("Lock", () => {
     }
   });
 });
+describe("Lock — stale reclaim visibility", () => {
+  test("a fresh lock reports no reclaim", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fup-lock-"));
+    const path = join(dir, "fup.lock");
+    try {
+      const lock = new Lock(path);
+      expect(await lock.acquire()).toBe(true);
+      expect(lock.reclaimedStaleLock).toBe(false);
+      expect(lock.reclaimedFrom).toBeUndefined();
+      await lock.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("acquiring over a dead-PID lock reports the reclaim and the dead PID", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fup-lock-"));
+    const path = join(dir, "fup.lock");
+    try {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      await mkdir(path);
+      // A PID astronomically unlikely to be alive on any system.
+      const deadPid = 2_000_000_000;
+      await writeFile(`${path}/pid`, String(deadPid));
+
+      const lock = new Lock(path);
+      expect(await lock.acquire()).toBe(true);
+      expect(lock.reclaimedStaleLock).toBe(true);
+      expect(lock.reclaimedFrom).toBe(deadPid);
+      await lock.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

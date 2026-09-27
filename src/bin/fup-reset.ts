@@ -3,7 +3,7 @@
  * for one user via `--coa`. All logic lives in `ops.ts`; this entrypoint only
  * parses argv, acquires the lock, and calls the shared helpers.
  */
-import { loadConfig, parseDebugLevel } from "../config.ts";
+import { loadConfig, parseDebugLevel, safeConfigSummary } from "../config.ts";
 import { createLogger, type Logger } from "../logger.ts";
 import { Lock } from "../lock.ts";
 import { createDb } from "../db.ts";
@@ -41,17 +41,24 @@ async function main(): Promise<void> {
     logger.log("SKIP", "another run holds the lock; exiting 0");
     process.exit(0);
   }
+  if (lock.reclaimedStaleLock) {
+    logger.log("LOCK_RECLAIMED", `stale lock cleared (previous owner: ${lock.reclaimedFrom})`);
+  }
 
   const db = createDb(cfg);
   const scope = username ?? "ALL";
-  logger.log("START", `fup-reset ${scope}${coa ? " --coa" : ""}`);
+  logger.log("START", `fup-reset ${scope}${coa ? " --coa" : ""} | ${safeConfigSummary(cfg)}`);
+  const startedAt = Date.now();
 
   try {
     // CoA-restore (when requested, or for every throttled user on a global
     // reset) happens inside resetUsers BEFORE the bookkeeping is cleared.
     const failed = await resetUsers(cfg, db, logger, username, coa);
     if (username && coa) logger.log(failed.length === 0 ? "COA_RESTORE" : "COA_FAILED", `${username}`);
-    logger.log("SUMMARY", `RESET ${scope}${failed.length ? ` restore_failed=${failed.length}` : ""}`);
+    logger.log(
+      "SUMMARY",
+      `RESET ${scope}${failed.length ? ` restore_failed=${failed.length}` : ""}, duration_ms=${Date.now() - startedAt}`,
+    );
   } finally {
     await db.close();
     await lock.release();

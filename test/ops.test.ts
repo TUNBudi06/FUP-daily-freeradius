@@ -164,3 +164,23 @@ describe("day boundary + rate safety", () => {
     expect((await sendCoa(cfg, logger, 'a"b', "10.0.0.1", "5M/5M", "throttle")).detail).toContain("refused");
   });
 });
+
+describe("prod-readiness logging", () => {
+  test("coaEventName: ACK/TIMEOUT/FAILED are distinguished", async () => {
+    const { coaEventName } = await import("../src/ops.ts");
+    expect(coaEventName({ channel: "throttle", ok: true, detail: "" })).toBe("COA_ACK");
+    expect(coaEventName({ channel: "throttle", ok: false, detail: "", timedOut: true })).toBe("COA_TIMEOUT");
+    expect(coaEventName({ channel: "throttle", ok: false, detail: "" })).toBe("COA_FAILED");
+  });
+
+  test("safeConfigSummary never includes the DB password or NAS secret", async () => {
+    const { defaultAppConfig, safeConfigSummary } = await import("../src/config.ts");
+    const cfg = defaultAppConfig();
+    const summary = safeConfigSummary(cfg);
+    expect(summary).not.toContain(cfg.db.password);
+    expect(summary).not.toContain(cfg.nas.secret);
+    expect(summary).toContain(cfg.nas.host);
+    expect(summary).toContain(cfg.db.host);
+    expect(summary).toContain(String(cfg.debugLevel));
+  });
+});

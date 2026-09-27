@@ -246,11 +246,44 @@ tail -f /var/log/fup.log
 A healthy first cycle looks like:
 
 ```
-START fup-check minute cron
+START fup-check minute cron | db=raduser@localhost:3306/raddb nas=10.6.7.1:3799 radclient=/usr/bin/radclient dict=/usr/share/freeradius dictDir=/etc/freeradius/3.0 debug=0
+ACTIVE_SESSIONS 12
 DAILY_USAGE alice = 13241280 bytes (quota=52428800)
-SUMMARY Processed 12 users, throttled=0, recovered=0
+SUMMARY Processed 12 users, throttled=0, recovered=0, duration_ms=182
 END fup-check
 ```
+
+The `START` line's config summary (never the DB password or NAS secret — those
+are always redacted) is the fastest way to confirm a cron run picked up the
+`.env` you expect. `ACTIVE_SESSIONS` gives a one-glance health signal even at
+the default debug level 0 — a sudden drop to `0` usually means a `radacct`/NAS
+problem, not that every subscriber disconnected at once. `duration_ms` in
+`SUMMARY` flags a cycle that's creeping toward the next minute's cron tick.
+
+### Log events reference
+
+| Event | Meaning |
+| --- | --- |
+| `START` / `END` | Cycle boundaries; `START` includes the config summary above. |
+| `LOCK_RECLAIMED` | The lock directory belonged to a dead PID (or was pid-less and stale) and was cleared before this run acquired it — the previous cycle didn't exit cleanly. Worth alerting on if it repeats. |
+| `ACTIVE_SESSIONS` | Count of open `radacct` sessions seen this cycle. |
+| `DAILY_USAGE` | Per-user (or aggregate, in per-device mode) usage vs. quota. |
+| `PER_DEVICE_ACTIVE` / `DEVICE_USAGE` / `DEVICE_THROTTLED` | Per-device mode detail (the latter two need `FUP_DEBUG=2`). |
+| `FUP_REACHED` | A user/device just crossed its quota. |
+| `THROTTLED` | CoA-ACK received for the throttled rate; the flag is now set. |
+| `RESET` | `FUP-Reset-Time` grace elapsed; about to CoA-restore. |
+| `RESTORE` | CoA-ACK received for the normal rate; the flag is now cleared and the quota rebased. |
+| `NEW_DAY` | The check cron found a user still throttled from a previous `fup_date` (the daily reset cron missed or hasn't run yet) and is restoring them. |
+| `SELF_HEAL` | `fup_state.throttled=1` had no matching `fup_state_throttled` rows (e.g. the last throttled session closed) — the flag was cleared. |
+| `STALE_THROTTLE_CLEARED` | A per-device join row's `radacct` session is no longer open; the row was dropped. |
+| `RESET_TARGETS` | A global `fup-reset` (no username) found N throttled users to CoA-restore before rebasing. |
+| `COA_ACK` | radclient reported `CoA-ACK`. |
+| `COA_TIMEOUT` | No radclient reply within the timeout — usually an unreachable NAS, distinct from a NAK/refusal. |
+| `COA_FAILED` | Anything else: NAK, `radclient` missing, or refused (unsafe username/IP/rate). The throttle flag is left untouched so the next cycle retries. |
+| `SKIP` | An invalid username, invalid IP, or an already-locked run was skipped. |
+| `ERROR` | A single user's cycle step failed (isolated — the rest of the cycle continues) or the whole process aborted before the lock/db were set up. |
+| `COA_DEBUG` / `COA_DETAIL` | `FUP_DEBUG=1`/`=2` only — radclient argv+body, and per-IP/attribute detail. |
+| `SUMMARY` | End-of-cycle counts, including `duration_ms`. |
 
 Forced end-to-end test (safe — the CoA is a real rate change):
 
@@ -267,11 +300,18 @@ After the daily reset you should see, for **every** user including mismatched /
 closed-session rows, usage back to ~0 on the next minute run:
 
 ```
-START fup-reset ALL
-SUMMARY RESET ALL
+START fup-reset ALL | db=raduser@localhost:3306/raddb nas=10.6.7.1:3799 radclient=/usr/bin/radclient dict=/usr/share/freeradius dictDir=/etc/freeradius/3.0 debug=0
+RESET_TARGETS 2 throttled user(s) to restore before the daily rollover
+COA_ACK ...
+RESTORE testuser -> 20M/20M
+SUMMARY RESET ALL, duration_ms=340
 ...
 DAILY_USAGE alice = 0 bytes (quota=52428800)   # post-reset
 ```
+
+`RESET_TARGETS` only appears on a **global** reset (no username) when at
+least one user is still flagged throttled — the daily reset now CoA-restores
+them first instead of just clearing the flag (see §8 if a restore fails).
 
 ### Debug console (single user, real CoA)
 

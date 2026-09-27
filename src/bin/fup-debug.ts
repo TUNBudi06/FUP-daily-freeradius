@@ -26,6 +26,7 @@ import {
   resolveUserPlan,
   validUser,
   redact,
+  coaEventName,
 } from "../ops.ts";
 import { sendCoa } from "../coa.ts";
 
@@ -72,20 +73,25 @@ async function main(): Promise<void> {
   // untouched — only this local copy is forced verbose.
   const debugCfg: AppConfig = { ...cfg, debugLevel: 2 };
   const results: string[] = [];
+  let allAck = true;
   for (const ip of ips) {
     const res = await sendCoa(debugCfg, logger, username, ip, plan.fupRate, "throttle");
-    results.push(
-      `  IP ${ip} -> ${plan.fupRate}: ${res.ok ? "✓ ACK" : "✗ FAILED"}  ${redact(res.detail, secretRedactor)}`,
-    );
+    if (!res.ok) allAck = false;
+    // Unlike the cron (coaFanOut), this tool calls sendCoa directly, so it must
+    // log the outcome itself — sendCoa only ever logs COA_DEBUG/COA_DETAIL.
+    const event = coaEventName(res);
+    logger.log(event, redact(`${username} IP=${ip} -> ${plan.fupRate} (${res.detail})`, secretRedactor));
+    const mark = res.ok ? "✓ ACK" : res.timedOut ? "✗ TIMEOUT" : "✗ FAILED";
+    results.push(`  IP ${ip} -> ${plan.fupRate}: ${mark}  ${redact(res.detail, secretRedactor)}`);
   }
 
   console.log("");
   console.log("── results ────────────────────────────────────────────────");
   for (const r of results) console.log(r);
-  console.log("(COA_DEBUG / COA_ACK / COA_FAILED lines also went to the log)");
+  console.log("(COA_DEBUG / COA_ACK / COA_TIMEOUT / COA_FAILED lines also went to the log)");
 
   await db.close();
-  if (results.every((r) => r.includes("✓ ACK"))) process.exit(0);
+  if (allAck) process.exit(0);
   process.exit(1);
 }
 

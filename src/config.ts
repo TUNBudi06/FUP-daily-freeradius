@@ -101,6 +101,21 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
   };
 }
 
+/**
+ * One-line, secret-free summary of the resolved config for the START log
+ * line — lets an operator confirm which DB/NAS/dictionaries a cron run
+ * actually loaded (a common source of "why isn't this picking up my .env"
+ * tickets) without ever printing the DB password or NAS secret.
+ */
+export function safeConfigSummary(cfg: AppConfig): string {
+  return (
+    `db=${cfg.db.user}@${cfg.db.host}:${cfg.db.port}/${cfg.db.database} ` +
+    `nas=${cfg.nas.host}:${cfg.nas.coaPort} ` +
+    `radclient=${cfg.radclientPath} dict=${cfg.radclientDict} dictDir=${cfg.radclientDictDir} ` +
+    `debug=${cfg.debugLevel}`
+  );
+}
+
 /** A fully-populated default config, used by tests and the entrypoints. */
 export function defaultAppConfig(): AppConfig {
   return loadConfig({

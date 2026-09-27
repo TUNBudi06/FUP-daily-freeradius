@@ -3,7 +3,7 @@
  * every attribute resolution, session delta, throttle decision, CoA fan-out,
  * and FUP-Reset-Time recovery lives in `ops.ts` exactly once.
  */
-import { loadConfig, parseDebugLevel } from "../config.ts";
+import { loadConfig, parseDebugLevel, safeConfigSummary } from "../config.ts";
 import { createLogger, type Logger } from "../logger.ts";
 import { Lock } from "../lock.ts";
 import { createDb } from "../db.ts";
@@ -21,16 +21,23 @@ async function main(): Promise<void> {
     logger.log("SKIP", "another run holds the lock; exiting 0");
     process.exit(0);
   }
+  // A stale lock is only ever cleared from a crashed prior run (dead PID, or
+  // a pid-less directory old enough that its owner must have died mid-acquire)
+  // — worth a distinct log line since it means the last cycle didn't exit clean.
+  if (lock.reclaimedStaleLock) {
+    logger.log("LOCK_RECLAIMED", `stale lock cleared (previous owner: ${lock.reclaimedFrom})`);
+  }
 
   const db = createDb(cfg);
-  logger.log("START", "fup-check minute cron");
+  logger.log("START", `fup-check minute cron | ${safeConfigSummary(cfg)}`);
+  const startedAt = Date.now();
 
   try {
     const { examined, throttled } = await runCheckCycle(cfg, db, logger);
     const recovered = await recoverResetTimeUsers(cfg, db, logger);
     logger.log(
       "SUMMARY",
-      `Processed ${examined} users, throttled=${throttled}, recovered=${recovered}`,
+      `Processed ${examined} users, throttled=${throttled}, recovered=${recovered}, duration_ms=${Date.now() - startedAt}`,
     );
   } finally {
     await db.close();

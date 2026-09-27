@@ -288,7 +288,11 @@ mysql raddb < migration.sql
 
 `FUP_DEBUG` is a level (0–2). Every level still writes the full log file; the
 level only controls how much is echoed to stderr and how much per-session
-detail is emitted.
+detail is emitted. Every event name the log can contain — `ACTIVE_SESSIONS`,
+`LOCK_RECLAIMED`, `SELF_HEAL`, `COA_TIMEOUT` vs `COA_FAILED`, etc. — is
+documented in **[DEPLOY.md §7 "Log events reference"](DEPLOY.md#7-verification)**;
+those events are all written at the default level `0`, so a normal cron run
+is fully auditable from the log file alone without turning on debug output.
 
 | `FUP_DEBUG` | Effect |
 | --- | --- |

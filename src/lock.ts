@@ -22,9 +22,28 @@ function isAlive(pid: number): boolean {
  */
 export class Lock {
   #dir: string;
+  #reclaimed = false;
+  #reclaimedFrom: number | "pidless" | undefined;
 
   constructor(lockPath: string) {
     this.#dir = lockPath;
+  }
+
+  /**
+   * True once `acquire()` won the lock only after clearing a stale one left
+   * by a crashed run. A fresh `Lock` starts false; check this right after a
+   * successful `acquire()` to log/alert on it — a stale lock usually means
+   * the previous cycle was killed (OOM, `kill -9`, host reboot) rather than
+   * exiting cleanly.
+   */
+  get reclaimedStaleLock(): boolean {
+    return this.#reclaimed;
+  }
+
+  /** The dead PID (or `"pidless"` if the pid file was missing) that owned the
+   *  lock this `acquire()` reclaimed, or undefined if nothing was reclaimed. */
+  get reclaimedFrom(): number | "pidless" | undefined {
+    return this.#reclaimedFrom;
   }
 
   /** True if this process won the lock, false if it is already held by a live process. */
@@ -38,6 +57,8 @@ export class Lock {
       try {
         const pid = Number(await readFile(`${this.#dir}/pid`, "utf8"));
         if (pid > 0 && !isAlive(pid)) {
+          this.#reclaimed = true;
+          this.#reclaimedFrom = pid;
           await rm(this.#dir, { recursive: true, force: true });
           return this.acquire(); // retry once
         }
@@ -48,6 +69,8 @@ export class Lock {
         try {
           const age = Date.now() - (await stat(this.#dir)).mtimeMs;
           if (age > PIDLESS_STALE_MS) {
+            this.#reclaimed = true;
+            this.#reclaimedFrom = "pidless";
             await rm(this.#dir, { recursive: true, force: true });
             return this.acquire();
           }
