@@ -7,3 +7,7 @@ dist/
 *.lock
 .DS_Store
 .idea/
+# Superseded by the TypeScript/Bun rewrite (src/bin/fup-check.ts, fup-reset.ts).
+fup-coa-*.sh
+# npm artifact; this project installs with Bun (bun.lock, itself ignored above).
+package-lock.json

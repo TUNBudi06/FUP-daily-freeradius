@@ -27,8 +27,8 @@ src/
 
 Both entrypoints only wire config → lock → logger → db, then call shared
 helpers from `ops.ts`. They never re-implement attribute resolution, session
-delta accounting, rebase, quota reset, or CoA fan-out. This mirrors the Bash
-`fup-coa-check.sh` / `fup-coa-reset.sh` behaviour.
+delta accounting, rebase, quota reset, or CoA fan-out. This preserves the
+behaviour of the original Bash implementation this project replaced.
 
 `bin/fup-debug.ts` is a third, **non-cron** entrypoint: unlike the minute cron
 it always fires a real CoA so an operator can see the exact argv, the CoA body,

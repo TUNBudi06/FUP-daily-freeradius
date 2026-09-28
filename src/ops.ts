@@ -3,7 +3,8 @@
  * and `fup-reset.ts`) share lives here exactly once. The entrypoints only wire
  * config, lock, logger, db, and these functions together; they never re-implement
  * attribute resolution, session delta accounting, rebase, quota reset, or CoA
- * fan-out. This mirrors the behaviour of `fup-coa-check.sh` / `fup-coa-reset.sh`.
+ * fan-out. This preserves the behaviour of the original Bash implementation
+ * this project replaced.
  */
 import type { AppConfig } from "./config.ts";
 import { isValidIp } from "./config.ts";
@@ -868,7 +869,7 @@ export async function runPerDeviceCheck(
 }
 
 /**
- * Run one full check cycle (mirrors `fup-coa-check.sh`): ensure a `fup_state`
+ * Run one full check cycle: ensure a `fup_state`
  * row and day rollover, then for each user past quota and not throttled, CoA
  * the FUP rate and mark throttled on an ACK. Returns per-user counters for the
  * SUMMARY log.
