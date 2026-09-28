@@ -260,12 +260,19 @@ concurrently.
 
 ## Database migration
 
-`migration.sql` makes three additive changes. The first is the only schema
-difference from the Bash version:
+**Brand-new `raddb`** (no `fup_state` / `fup_session_state` yet)? Run
+`create.sql` first — it creates all three FUP tables from scratch:
+
+```bash
+mysql raddb < create.sql
+```
+
+Either way, run `migration.sql` — it makes three additive, re-run-safe
+changes. The first is the only schema difference from the Bash version:
 
 ```sql
 ALTER TABLE fup_state
-  ADD COLUMN throttled_at TIMESTAMP NULL DEFAULT NULL;
+  ADD COLUMN IF NOT EXISTS throttled_at TIMESTAMP NULL DEFAULT NULL;
 -- rollback:
 -- ALTER TABLE fup_state DROP COLUMN throttled_at;
 ```
@@ -278,6 +285,11 @@ Run the whole file on your raddb schema before deploying the .ts cronjobs:
 ```bash
 mysql raddb < migration.sql
 ```
+
+`create.sql` and `migration.sql` are both safe to run more than once, in any
+order — every statement in each is guarded (`CREATE TABLE IF NOT EXISTS`,
+`ADD COLUMN IF NOT EXISTS`), so running one after the other never fails on
+"already exists".
 
 > **Note:** the Bash bootstrap inserted a resolved `normal_rate` (never NULL), but the TypeScript bootstrap seeds `NULL` (rate is resolved later, at throttle time). If your live `fup_state.normal_rate` is `NOT NULL` (the Bash-era default), apply the one-time adjustment to allow the seed:
 > ```sql
@@ -465,8 +477,9 @@ Follow the detailed [DEPLOY.md](DEPLOY.md) guide. Quick version:
    `bun install` only if you'll run from source. (Both are covered in the
    Build section above and in DEPLOY.md §2.)
 2. `cp .env.example .env` and fill in DB / NAS credentials.
-3. **Apply the migration before deploying the cronjobs** (see the Database
-   migration section above and DEPLOY.md §4): `mysql raddb < migration.sql`.
+3. **Apply the schema before deploying the cronjobs** (see the Database
+   migration section above and DEPLOY.md §4): on a brand-new `raddb`, `mysql
+   raddb < create.sql` first; either way, `mysql raddb < migration.sql`.
 4. Set `Max-Daily-Traffic`, `Mikrotik-Rate-Limit`, `FUP-Rate-Limit` and
    (optional) `FUP-Reset-Time` per user/group in the RADIUS config. To
    enable per-device quota evaluation, additionally set `FUP-Per-Device=1`

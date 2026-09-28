@@ -1,6 +1,9 @@
 -- Record when a throttle was applied. FUP-Reset-Time auto-unthrottle compares
 -- the wall clock against throttled_at + resetMinutes.
-ALTER TABLE fup_state ADD COLUMN throttled_at TIMESTAMP NULL DEFAULT NULL;
+-- IF NOT EXISTS (MariaDB 10.0.2+ / MySQL 8.0.29+) makes this safe to re-run —
+-- without it, a second run (or running this after create.sql, which already
+-- includes the column) fails with "Duplicate column name 'throttled_at'".
+ALTER TABLE fup_state ADD COLUMN IF NOT EXISTS throttled_at TIMESTAMP NULL DEFAULT NULL;
 
 -- The bootstrap INSERT (runCheckCycle) seeds fup_state from fup_session_state with
 -- normal_rate = NULL (rate is resolved later, at throttle time). The live table

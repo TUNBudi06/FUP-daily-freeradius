@@ -23,10 +23,11 @@ runs from source with `bun run debug <user> [ip]`. See §7.
 
 - **Bun ≥ 1.4** — only needed to *build* the binaries (or to run from source).
   The deployed binary itself needs no Bun at runtime.
-- **MySQL/MariaDB** with the FreeRADIUS `raddb` schema
+- **MySQL/MariaDB** with the FreeRADIUS `raddb` schema already in place
   (`radcheck`, `radreply`, `radusergroup`, `radgroupcheck`, `radgroupreply`,
-  `radacct`, plus the FUP tables `fup_state` and `fup_session_state`). The
-  per-device join table `fup_state_throttled` is created by `migration.sql`
+  `radacct`). The three FUP-specific tables — `fup_state`, `fup_session_state`,
+  and the per-device join table `fup_state_throttled` — are created by
+  `create.sql` (fresh install) and/or brought up to date by `migration.sql`
   (see §4).
 - **radclient** (from the `freeradius-utils` package) on the machine that will
   fire CoAs:
@@ -115,18 +116,33 @@ Secrets are read from the environment only, never hardcoded or logged
 
 ## 4. Database migration
 
-Run `migration.sql` once before the first cycle:
+Two files, for two starting points — **run whichever fits, or both** (running
+both is always safe; each statement in each file is guarded):
+
+| Your `raddb` already has... | Run |
+| --- | --- |
+| No `fup_state` / `fup_session_state` at all (brand-new FreeRADIUS install, or one that never ran the FUP throttler before) | `create.sql`, then `migration.sql` |
+| `fup_state` / `fup_session_state` from the original Bash throttler (`fup-coa-check.sh` / `fup-coa-reset.sh`) | `migration.sql` only |
 
 ```bash
-mysql raddb < migration.sql
+mysql raddb < create.sql      # only if fup_state/fup_session_state don't exist yet
+mysql raddb < migration.sql   # always
 ```
 
-It makes three changes — the `throttled_at` column, the `normal_rate`
+`create.sql` creates all three FUP tables (`fup_state`, `fup_session_state`,
+`fup_state_throttled`) in their current shape with `CREATE TABLE IF NOT
+EXISTS`, so it never touches a table that already exists — running it against
+an already-migrated `raddb` is a safe no-op. It does **not** touch
+FreeRADIUS's own tables (`radcheck`, `radreply`, `radgroupcheck`,
+`radgroupreply`, `radusergroup`, `radacct`); those must already exist from
+your FreeRADIUS install.
+
+`migration.sql` makes three changes — the `throttled_at` column, the `normal_rate`
 nullability fix, and the per-device join table:
 
 ```sql
 ALTER TABLE fup_state
-  ADD COLUMN throttled_at TIMESTAMP NULL DEFAULT NULL;
+  ADD COLUMN IF NOT EXISTS throttled_at TIMESTAMP NULL DEFAULT NULL;
 ALTER TABLE fup_state MODIFY normal_rate VARCHAR(64) NULL DEFAULT NULL;
 
 CREATE TABLE IF NOT EXISTS fup_state_throttled (
@@ -141,7 +157,10 @@ CREATE TABLE IF NOT EXISTS fup_state_throttled (
 ```
 
 - `throttled_at` drives FUP-Reset-Time auto-restore (timestamps the moment a
-  user is throttled).
+  user is throttled). `IF NOT EXISTS` (MariaDB 10.0.2+ / MySQL 8.0.29+) is
+  what makes this safe to re-run — plain `ADD COLUMN` fails with "Duplicate
+  column name" on a second run, or after `create.sql` already created the
+  column.
 - The `MODIFY` allows NULL so the bootstrap seed can write an unresolved
   `normal_rate`; safe to re-run on an already-migrated DB.
 - `fup_state_throttled` holds one row per throttled `(username, acctuniqueid)`

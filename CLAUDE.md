@@ -22,5 +22,5 @@ Daily Fair-Use-Policy (FUP) throttling for FreeRADIUS/MikroTik. TypeScript + Bun
 ## Build / schema gotchas
 
 - `scripts/build.mjs` only compiles `check` and `reset` into `dist/`. `fup-debug` is not a build target (run it from source).
-- Schema changes go in `migration.sql` and must be additive and safe to re-run (`CREATE TABLE IF NOT EXISTS`, etc.). Per-device mode depends on the `fup_state_throttled` table.
+- Schema changes go in `migration.sql` and must be additive and safe to re-run (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, etc. — a bare `ADD COLUMN` breaks re-runs). Per-device mode depends on the `fup_state_throttled` table. `create.sql` is the from-scratch counterpart for a `raddb` with no FUP tables yet — keep both files' table shapes in sync.
 - `.gitignore` excludes `*.lock`, `*.log`, `dist/`, `package-lock.json`, and the legacy Bash scripts (`fup-coa-*.sh`). Bun's lockfile is `bun.lock`; ignore `package-lock.json`.
