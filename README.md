@@ -57,6 +57,7 @@ flowchart TD
     %% Shared ops.ts logic
     subgraph OPS ["ops.ts (shared logic)"]
         CYCLE["runCheckCycle"]
+        RESUSERS["resetUsers<br/>(CoA-restore throttled users<br/>BEFORE clearing state)"]
         RESQ["resetQuota"]
         REBASE["rebaseSessionBaselines<br/>(zero ALL users)"]
         UNTHROT["unthrottleUser"]
@@ -66,8 +67,8 @@ flowchart TD
 
     CHECK --> CYCLE
     CHECK --> RECOVER
-    RESET --> RESQ --> REBASE
-    RESET -.->|if --coa + username| UNTHROT
+    RESET --> RESUSERS --> RESQ --> REBASE
+    RESUSERS -.->|every still-throttled user,<br/>or --coa username| UNTHROT
 
     %% DB reads/writes per step
     CYCLE -->|"fetch open sessions<br/>+ radacct deltas"| DB
@@ -75,6 +76,7 @@ flowchart TD
     CYCLE -->|"resolve plan radcheck/groupcheck"| DB
     CYCLE -->|"throttle needed"| COAFAN
     CYCLE -->|"INSERT throttled=1 throttled_at"| DB
+    CYCLE -.->|"stale fup_date + throttled=1"| UNTHROT
     RECOVER -->|"find throttled + timer elapsed"| DB
     RECOVER -->|"UPDATE throttled=0 + CoA"| COAFAN
     RESQ -->|"UPDATE fup_date = today"| DB
@@ -92,10 +94,15 @@ flowchart TD
 
 The graph shows the two entrypoints converging on the same `config → lock →
 logger → db` wiring, then diverging into the matching subset of `ops.ts`
-helpers. Only `fup-reset.ts` ever calls `resetQuota` / `rebaseSessionBaselines`
-/ `unthrottleUser`; only `fup-check.ts` ever calls `runCheckCycle` /
-`recoverResetTimeUsers`. The shared `Lock` is what guarantees the minute cron
-and the daily rollover can never touch the same row at the same time.
+helpers. `fup-reset.ts` only ever calls `resetUsers`, which CoA-restores
+every user still flagged throttled (or just the given `--coa` user) via
+`unthrottleUser` *before* `resetQuota` / `rebaseSessionBaselines` clear the
+bookkeeping — restoring the router after wiping the state would leave nothing
+to CoA. `runCheckCycle` does the same restore-then-clear for a user whose
+`fup_date` rolled over without a reset having run. Only `fup-check.ts` ever
+calls `runCheckCycle` / `recoverResetTimeUsers`. The shared `Lock` is what
+guarantees the minute cron and the daily rollover can never touch the same
+row at the same time.
 
 ## Setup
 
